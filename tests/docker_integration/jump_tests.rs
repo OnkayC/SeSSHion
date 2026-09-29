@@ -39,6 +39,8 @@ async fn start_container() -> (testcontainers::ContainerAsync<GenericImage>, Str
 
 fn target_config(key_path: PathBuf, jump: JumpConfig) -> Config {
     Config {
+        agent: None,
+        auth_timeout_ms: None,
         host: "127.0.0.1".to_string(),
         port: 2222,
         user: "test".to_string(),
@@ -73,6 +75,7 @@ async fn key_jump_routes_command_and_sftp_with_distinct_keys() {
     let config = target_config(
         target_key,
         JumpConfig {
+            agent: None,
             host: jump_host,
             port: jump_port,
             user: "jump".to_string(),
@@ -122,6 +125,7 @@ async fn password_jump_uses_exec_raw_and_rejects_explicit_sftp() {
     let config = target_config(
         target_key,
         JumpConfig {
+            agent: None,
             host: jump_host,
             port: jump_port,
             user: "jump".to_string(),

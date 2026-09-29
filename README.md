@@ -25,7 +25,7 @@ Its capability-bound toolset combines deterministic long-running jobs, bounded c
 | `check_process` | Poll a command or transfer background job by `job_id`. |
 | `apply_patch` | Create, update, or delete remote UTF-8 files with one exact patch (atomic per file, conflict-checked). |
 | `sudo_apply_patch` | Same exact patch flow under `sudo`; can be disabled with `--disable-sudo`. |
-| `transfer` | Move files/directories (`put`/`get`); `background=true` returns immediately. `auto` falls back through `rsync` → `sftp` → `scp` → `exec-raw` only when a transport is unavailable before writing. |
+| `transfer` | Move files/directories (`put`/`get`); `background=true` returns immediately. `auto` uses `exec-raw` for agent-backed routes; otherwise it safely falls back through `rsync` → `sftp` → `scp` → `exec-raw` before writing. |
 
 Full parameter schemas are served to the client at runtime; deeper references live in [`Docs/`](#documentation).
 
@@ -250,7 +250,7 @@ Set `--strict-host-key-checking=yes` and point at a pre-populated `known_hosts` 
 
 ## Configuration
 
-Every flag also has an `SSH_MCP_*` environment variable. Required: `--host`, `--user`, and one of `--password` / `--key`.
+Every flag also has an `SSH_MCP_*` environment variable. Required: `--host`, `--user`, and either `--agent` or legacy credentials (`--password` and/or `--key`). In legacy mode, password takes precedence when both are configured.
 
 | Argument | Env | Description |
 |----------|-----|-------------|
@@ -259,9 +259,16 @@ Every flag also has an `SSH_MCP_*` environment variable. Required: `--host`, `--
 | `--port` | `SSH_MCP_PORT` | SSH port (default: 22) |
 | `--password` | `SSH_MCP_PASSWORD` | SSH password (alternative to key) |
 | `--key` | `SSH_MCP_KEY` | Path to private key file (leading `~/` uses local `HOME`) |
+| `--agent` | `SSH_MCP_AGENT` | Agent-only target authentication (Unix; `false` does not enable it) |
+| `--agent-socket` | `SSH_MCP_AGENT_SOCKET` | Target socket override; otherwise snapshot `SSH_AUTH_SOCK` at startup |
+| `--agent-identity` | `SSH_MCP_AGENT_IDENTITY` | OpenSSH public-key selector, never a private-key file |
+| `--auth-timeout-ms` | `SSH_MCP_AUTH_TIMEOUT_MS` | Entire authentication budget per endpoint, 1–600000 ms; agent default 90000 |
 | `--jump` | `SSH_MCP_JUMP` | One jump host as `USER@HOST[:PORT]` |
 | `--jump-key` | `SSH_MCP_JUMP_KEY` | Jump private key path (leading `~/` uses local `HOME`) |
 | `--jump-password` | `SSH_MCP_JUMP_PASSWORD` | Jump SSH login password (alternative to jump key) |
+| `--jump-agent` | `SSH_MCP_JUMP_AGENT` | Agent-only jump authentication, independent of the target |
+| `--jump-agent-socket` | `SSH_MCP_JUMP_AGENT_SOCKET` | Jump socket override; otherwise snapshot `SSH_AUTH_SOCK` |
+| `--jump-agent-identity` | `SSH_MCP_JUMP_AGENT_IDENTITY` | Independent jump public-key selector |
 | `--spool-dir` | `SSH_MCP_SPOOL_DIR` | Absolute local directory for background job logs and state |
 | `--sudo-password` | `SSH_MCP_SUDO_PASSWORD` | Password for `sudo` commands |
 | `--timeout` | `SSH_MCP_TIMEOUT` | Command timeout in ms (default: 300000) |
@@ -281,6 +288,129 @@ The explicit spool path must be absolute. Without it, Unix uses `$XDG_RUNTIME_DI
 - `no`: disable verification; only for disposable test environments.
 
 With a jump host, the same policy and `known_hosts` file are applied independently to jump and target host/port identities. `accept-new` records unknown keys but rejects changed keys.
+
+### SSH-agent authentication
+
+On macOS and Linux, `--agent` uses an existing local agent to sign SSH authentication requests. It supports Ed25519, ECDSA P-256/P-384, and RSA SHA-2 identities, including keys loaded through a user-managed PKCS#11 workflow. SeSSHion never exports a private key or collects a PIN/passphrase. Configure the PIV identity using [Yubico's SSH guide](https://developers.yubico.com/PIV/Guides/SSH_with_PIV_and_PKCS11.html) and confirm it appears in `ssh-add -L`.
+
+```bash
+ssh-mcp \
+  --host devbox.example.com --user developer \
+  --agent --agent-identity "$HOME/.ssh/yubikey-piv.pub" \
+  --auth-timeout-ms 90000 \
+  --strict-host-key-checking yes --known-hosts "$HOME/.ssh/known_hosts" \
+  --spool-dir "$HOME/.cache/sesshion/codex"
+```
+
+Use a host key verified through a trusted channel in `known_hosts`; strict mode verifies it before contacting the agent. Each endpoint chooses its explicit socket override first, then the startup value of `SSH_AUTH_SOCK`. Leading `~/` expands through local `HOME`. The socket need not exist at startup; a later tool call can recover after the configured agent starts. A changed socket pathname requires relaunching the MCP process.
+
+Agent mode is explicit and conflicts with that endpoint's password/private-key options, including environment credentials. Remove stale `SSH_MCP_PASSWORD` / `SSH_MCP_KEY` values when enabling it. Socket/selector flags require their corresponding agent mode; jump options also require `--jump`. Jump credentials never inherit target settings: combine `--jump user@bastion --jump-agent --jump-agent-identity /path/jump.pub` with any supported target mode.
+
+Selectors contain exactly one OpenSSH public key, optionally with blank/comment lines, and are limited to 16 KiB. Matching uses public-key data, ignoring comments and enumeration order. Without a selector, exactly one eligible plain public key must be loaded. Certificates are excluded from selection and counting; certificate selectors and destination-constrained keys are unsupported. No failed agent attempt falls back to another key, password, or disk key.
+
+The 90-second agent budget covers socket connection, identities, unsigned probes, signing, and the server reply. Jump and target each receive their own budget. An explicit `--auth-timeout-ms` also sets an entire endpoint budget for legacy modes; without it, their existing 20-second per-request behavior remains. Authentication failure is terminal for an agent attempt, and at most one signature is requested per endpoint attempt. A later explicit tool call starts fresh; transient transport failures retain bounded reconnect retries.
+
+When either endpoint uses an agent, `auto` chooses `exec-raw` directly. File/directory uploads and downloads, foreground/background jobs, overwrite checks, and cancellation use the authenticated route. Explicit `sftp`, `scp`, and `rsync` requests fail before destination mutation.
+
+This provides authentication only. The local socket is never forwarded to the remote host. Connection reuse is SeSSHion's own persistent connection, independent of OpenSSH `ControlMaster`. Removing the token does not revoke an already authenticated session. Background-job durability remains as described below.
+
+### Client setup for Herdr
+
+Launch one stdio MCP process per local client from Herdr's environment, with `SSH_AUTH_SOCK` available to each child. Give Codex, oh-my-pi, Grok, and Amp distinct absolute spool directories and separate remote worktrees. Keep ephemeral socket paths out of shared configuration; pass the environment value at launch. These examples use `/Users/alice` as a placeholder for an absolute local home path.
+
+The following client examples are **protocol-compatible only**: their settings were checked against the linked client documentation, but interactive client sessions and physical hardware were not exercised. The actual SeSSHion stdio workflow is exercised by the four-process integration test. Authentication is lazy, so client per-tool deadlines must accommodate the endpoint budgets plus command work; a route with two agent endpoints can need more than 180 seconds. Client startup timeouts are unaffected.
+
+**Codex** — `~/.codex/config.toml` ([configuration reference](https://developers.openai.com/codex/config-reference)):
+
+```toml
+[mcp_servers.sesshion]
+command = "/absolute/path/to/ssh-mcp"
+args = ["--host", "devbox.example.com", "--user", "developer", "--agent",
+        "--agent-identity", "/Users/alice/.ssh/yubikey-piv.pub",
+        "--strict-host-key-checking", "yes",
+        "--spool-dir", "/Users/alice/.cache/sesshion/codex"]
+env_vars = ["SSH_AUTH_SOCK"]
+tool_timeout_sec = 120
+```
+
+Codex's default per-tool timeout is 60 seconds, below the single-endpoint agent default. Raise `tool_timeout_sec` further for two hops or longer foreground commands.
+
+**oh-my-pi** — `~/.omp/agent/mcp.json` ([MCP configuration](https://github.com/can1357/oh-my-pi/blob/HEAD/docs/mcp-config.md)):
+
+```json
+{
+  "mcpServers": {
+    "sesshion": {
+      "type": "stdio",
+      "command": "/absolute/path/to/ssh-mcp",
+      "args": ["--host", "devbox.example.com", "--user", "developer", "--agent",
+               "--agent-identity", "/Users/alice/.ssh/yubikey-piv.pub",
+               "--strict-host-key-checking", "yes",
+               "--spool-dir", "/Users/alice/.cache/sesshion/omp"],
+      "env": {"SSH_AUTH_SOCK": "${SSH_AUTH_SOCK}"},
+      "timeout": 120000
+    }
+  }
+}
+```
+
+OMP's `OMP_MCP_TIMEOUT_MS` overrides the per-server timeout; ensure it is unset or sufficiently large.
+
+**Grok CLI** — `~/.grok/config.toml` ([MCP configuration](https://docs.x.ai/build/features/mcp-servers)):
+
+```toml
+[mcp_servers.sesshion]
+command = "/absolute/path/to/ssh-mcp"
+args = ["--host", "devbox.example.com", "--user", "developer", "--agent",
+        "--agent-identity", "/Users/alice/.ssh/yubikey-piv.pub",
+        "--strict-host-key-checking", "yes",
+        "--spool-dir", "/Users/alice/.cache/sesshion/grok"]
+env = { SSH_AUTH_SOCK = "${SSH_AUTH_SOCK}" }
+tool_timeout_sec = 120
+```
+
+**Amp** — `~/.config/amp/settings.json` ([MCP configuration](https://ampcode.com/docs/customize/mcp)):
+
+```json
+{
+  "amp.mcpServers": {
+    "sesshion": {
+      "command": "/absolute/path/to/ssh-mcp",
+      "args": ["--host", "devbox.example.com", "--user", "developer", "--agent",
+               "--agent-identity", "/Users/alice/.ssh/yubikey-piv.pub",
+               "--strict-host-key-checking", "yes",
+               "--spool-dir", "/Users/alice/.cache/sesshion/amp"],
+      "env": {"SSH_AUTH_SOCK": "${SSH_AUTH_SOCK}"}
+    }
+  }
+}
+```
+
+Amp's documented server schema does not specify a per-tool deadline override. Start initial authentication with `shell` using `background=true`, then poll `check_process`; background handoff returns before SSH authentication. Use this also when a client's foreground deadline is shorter than a two-hop budget. A readiness/startup setting is not an authentication timeout.
+
+### Agent troubleshooting and hardware verification
+
+| Failure | Action |
+|---------|--------|
+| Socket not reachable | Check the explicit override and `SSH_AUTH_SOCK` inheritance; start the configured agent. Relaunch SeSSHion if its socket pathname changed. |
+| No usable identities | Inspect `ssh-add -L`; load the intended PIV key through your existing `ssh-add -s <pkcs11-library>` workflow. Certificate-only agents are unsupported. |
+| Multiple identities / selector not loaded | Set the correct `.pub` selector for that endpoint and compare its fingerprint with the loaded plain keys. |
+| Server did not accept identity; no signature requested | Check the remote user's authorized public key and accepted algorithms. Agent RSA never uses SHA-1. |
+| Agent refused to sign | Inspect the agent/hardware workflow. A generic refusal does not distinguish PIN, touch, removal, or destination constraints. Constrained keys require session binding that this release does not provide; retain their constraints. |
+| Server rejected signature | Check remote authorization and server diagnostics; the attempt stops after that signature. |
+| Authentication timeout / agent connection lost | Check agent availability and local client deadlines, then make a fresh explicit attempt. |
+| Unsupported platform | Agent authentication requires macOS/Linux Unix-domain sockets. |
+
+Automated coverage uses disposable software identities and agents. The physical YubiKey checklist remains **not run** until a user-managed token and host are available:
+
+```bash
+SSH_MCP_YUBIKEY_TEST=1 \
+SSH_MCP_YUBIKEY_PUB=/absolute/path/yubikey-piv.pub \
+SSH_MCP_YUBIKEY_HOST=developer@devbox.example.com \
+cargo test --test yubikey_smoke -- --ignored --nocapture
+```
+
+The ignored smoke uses strict `~/.ssh/known_hosts` and verifies a command plus fresh reconnect. Separately record PIN/touch policy, delayed touch beyond the budget, refusal, removal/reinsertion, and simultaneous initial/reconnections from all four clients. Exercise commands, patches, background status, and `exec-raw` transfers in each client. Never script wrong-PIN attempts; a PIV PIN can have only three retries.
 
 ## Long-running jobs
 

@@ -31,7 +31,7 @@ use crate::server::handlers::file_edit_common::{FileEditFaultInjection, FileEdit
 #[cfg(test)]
 use crate::server::validation::validate_background_log_path;
 use crate::ssh::{
-    CommandOutput, SshConfig, SshConnectionManager, SshJumpConfig, sanitize_command,
+    CommandOutput, EndpointAuth, SshConfig, SshConnectionManager, SshJumpConfig, sanitize_command,
     wrap_sudo_command,
 };
 use crate::tools::ApplyPatchParams;
@@ -150,46 +150,79 @@ impl SshMcpServer {
         // Build SSH configuration
         let mut ssh_config = SshConfig::new(&config.host, &config.user).with_port(config.port);
 
-        // Add authentication
-        if let Some(ref password) = config.password {
-            ssh_config = ssh_config.with_password(password);
+        if config.agent.is_some() && (config.password.is_some() || config.key.is_some()) {
+            return Err(SshMcpError::config(
+                "--agent conflicts with --password / SSH_MCP_PASSWORD and --key / SSH_MCP_KEY",
+            ));
         }
-
-        if let Some(ref key_path) = config.key {
-            // Read the key file
-            let key_content = tokio::fs::read_to_string(key_path)
-                .await
-                .map_err(SshMcpError::Io)?;
-            ssh_config = ssh_config.with_private_key(&key_content);
+        if config
+            .auth_timeout_ms
+            .is_some_and(|value| !(1..=600_000).contains(&value))
+        {
+            return Err(SshMcpError::config(
+                "--auth-timeout-ms must be between 1 and 600000",
+            ));
         }
-
-        if let Some(ref jump) = config.jump {
-            let jump_password = jump.password.clone().filter(|value| !value.is_empty());
-            if jump.user.is_empty()
-                || jump.host.is_empty()
-                || jump.port == 0
-                || jump.key.is_some() == jump_password.is_some()
-            {
-                return Err(SshMcpError::config(
-                    "jump requires a valid endpoint and exactly one key or password",
-                ));
-            }
-
-            let jump_private_key = match &jump.key {
-                Some(path) => Some(tokio::fs::read_to_string(path).await.map_err(|error| {
-                    SshMcpError::config(format!(
-                        "failed to read jump SSH key {}: {error}",
-                        path.display()
-                    ))
-                })?),
+        #[cfg(not(unix))]
+        if config.agent.is_some()
+            || config
+                .jump
+                .as_ref()
+                .is_some_and(|jump| jump.agent.is_some())
+        {
+            return Err(SshMcpError::config(
+                "SSH-agent authentication requires a Unix-domain socket (not available on this platform)",
+            ));
+        }
+        ssh_config.auth = if let Some(agent) = &config.agent {
+            EndpointAuth::agent(agent.clone())
+        } else {
+            let private_key = match &config.key {
+                Some(path) => Some(
+                    tokio::fs::read_to_string(path)
+                        .await
+                        .map_err(SshMcpError::Io)?,
+                ),
                 None => None,
             };
+            EndpointAuth::legacy(config.password.clone(), private_key)
+        };
+        if let Some(timeout) = config.auth_timeout_ms {
+            ssh_config.auth.timeout = Some(Duration::from_millis(timeout));
+        }
+
+        if let Some(jump) = &config.jump {
+            let jump_password = jump.password.clone().filter(|value| !value.is_empty());
+            let methods = usize::from(jump.key.is_some())
+                + usize::from(jump_password.is_some())
+                + usize::from(jump.agent.is_some());
+            if jump.user.is_empty() || jump.host.is_empty() || jump.port == 0 || methods != 1 {
+                return Err(SshMcpError::config(
+                    "jump requires a valid endpoint and exactly one of --jump-key / SSH_MCP_JUMP_KEY, --jump-password / SSH_MCP_JUMP_PASSWORD, or --jump-agent",
+                ));
+            }
+            let mut auth = if let Some(agent) = &jump.agent {
+                EndpointAuth::agent(agent.clone())
+            } else {
+                let private_key = match &jump.key {
+                    Some(path) => Some(tokio::fs::read_to_string(path).await.map_err(|error| {
+                        SshMcpError::config(format!(
+                            "failed to read jump SSH key {}: {error}",
+                            path.display()
+                        ))
+                    })?),
+                    None => None,
+                };
+                EndpointAuth::legacy(jump_password, private_key)
+            };
+            if let Some(timeout) = config.auth_timeout_ms {
+                auth.timeout = Some(Duration::from_millis(timeout));
+            }
             ssh_config = ssh_config.with_jump(SshJumpConfig {
                 host: jump.host.clone(),
                 port: jump.port,
                 username: jump.user.clone(),
-                password: jump_password,
-                private_key: jump_private_key,
+                auth,
             });
         }
 
@@ -602,6 +635,12 @@ impl SshMcpServer {
                         port: self.config.port,
                         user: self.config.user.clone(),
                         key_path,
+                        agent_route: self.config.agent.is_some()
+                            || self
+                                .config
+                                .jump
+                                .as_ref()
+                                .is_some_and(|jump| jump.agent.is_some()),
                         host_key_checking: self.config.strict_host_key_checking,
                         known_hosts: self.config.known_hosts.clone(),
                         jump: self.config.jump.as_ref().map(|jump| TransferJumpOptions {
@@ -877,10 +916,74 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn programmatic_agent_credentials_reject_conflicts_before_key_reads() {
+        let spool = tempfile::tempdir().unwrap();
+        let agent = crate::ssh::AgentAuth {
+            socket: spool.path().join("not-running.sock"),
+            identity: None,
+        };
+        let config = Config {
+            agent: Some(agent.clone()),
+            auth_timeout_ms: None,
+            host: "example.test".into(),
+            port: 22,
+            user: "tester".into(),
+            password: None,
+            key: Some(spool.path().join("missing-private-key")),
+            jump: None,
+            su_password: None,
+            sudo_password: None,
+            timeout_ms: 1_000,
+            max_chars: None,
+            max_output_tokens: Some(1_000),
+            disable_sudo: true,
+            keepalive_interval: 30,
+            keepalive_max: 3,
+            reconnect_retries: 0,
+            reconnect_backoff_ms: 250,
+            health_probe_timeout_ms: 1_500,
+            strict_host_key_checking: crate::ssh::HostKeyCheckMode::No,
+            known_hosts: None,
+        };
+        let error =
+            SshMcpServer::new_with_spool_dir(config.clone(), Some(spool.path().join("conflict")))
+                .await
+                .err()
+                .unwrap();
+        assert!(error.to_string().contains("--agent conflicts"));
+        let mut config = config;
+        config.key = None;
+        config.jump = Some(crate::config::JumpConfig {
+            host: "jump.test".into(),
+            port: 22,
+            user: "jump".into(),
+            password: None,
+            key: Some(spool.path().join("missing-jump-private-key")),
+            agent: Some(agent),
+        });
+        let error = SshMcpServer::new_with_spool_dir(
+            config.clone(),
+            Some(spool.path().join("jump-conflict")),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("exactly one"));
+        config.jump.as_mut().unwrap().key = None;
+        let server = SshMcpServer::new_with_spool_dir(config, Some(spool.path().join("agent")))
+            .await
+            .unwrap();
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn test_server_instructions_define_user_facing_error_policy() {
         let spool = tempfile::tempdir().expect("temp spool parent");
         let server = SshMcpServer::new_with_spool_dir(
             Config {
+                agent: None,
+                auth_timeout_ms: None,
                 host: "example.test".to_string(),
                 port: 22,
                 user: "tester".to_string(),

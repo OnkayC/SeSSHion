@@ -3,6 +3,66 @@
 //! Configuration for SSH connection parameters including authentication.
 
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// Resolved SSH-agent socket and optional public identity selector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentAuth {
+    pub socket: PathBuf,
+    pub identity: Option<russh::keys::PublicKey>,
+}
+
+/// Authentication material for one endpoint.
+#[derive(Clone)]
+pub enum AuthMethod {
+    Legacy {
+        password: Option<String>,
+        private_key: Option<String>,
+    },
+    Agent(AgentAuth),
+}
+
+impl std::fmt::Debug for AuthMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Legacy {
+                password,
+                private_key,
+            } => f
+                .debug_struct("Legacy")
+                .field("password", &password.as_ref().map(|_| "[REDACTED]"))
+                .field("private_key", &private_key.as_ref().map(|_| "[REDACTED]"))
+                .finish(),
+            Self::Agent(agent) => f.debug_tuple("Agent").field(agent).finish(),
+        }
+    }
+}
+
+/// Endpoint authentication and optional shared deadline budget.
+#[derive(Clone, Debug)]
+pub struct EndpointAuth {
+    pub method: AuthMethod,
+    pub timeout: Option<Duration>,
+}
+
+impl EndpointAuth {
+    pub fn legacy(password: Option<String>, private_key: Option<String>) -> Self {
+        Self {
+            method: AuthMethod::Legacy {
+                password,
+                private_key,
+            },
+            timeout: None,
+        }
+    }
+
+    pub fn agent(agent: AgentAuth) -> Self {
+        Self {
+            method: AuthMethod::Agent(agent),
+            timeout: Some(Duration::from_secs(90)),
+        }
+    }
+}
 
 use clap::ValueEnum;
 
@@ -48,11 +108,8 @@ pub struct SshConfig {
     /// Username for authentication
     pub username: String,
 
-    /// Password for password authentication
-    pub password: Option<String>,
-
-    /// Private key content (not path!) for key authentication
-    pub private_key: Option<String>,
+    /// Independent endpoint authentication.
+    pub auth: EndpointAuth,
 
     /// Optional SSH jump host with independent authentication material.
     pub jump: Option<SshJumpConfig>,
@@ -97,8 +154,7 @@ pub struct SshJumpConfig {
     pub host: String,
     pub port: u16,
     pub username: String,
-    pub password: Option<String>,
-    pub private_key: Option<String>,
+    pub auth: EndpointAuth,
 }
 
 impl SshConfig {
@@ -108,8 +164,7 @@ impl SshConfig {
             host: host.into(),
             port: 22,
             username: username.into(),
-            password: None,
-            private_key: None,
+            auth: EndpointAuth::legacy(None, None),
             jump: None,
             su_password: None,
             sudo_password: None,
@@ -132,13 +187,37 @@ impl SshConfig {
 
     /// Set password authentication
     pub fn with_password(mut self, password: impl Into<String>) -> Self {
-        self.password = Some(password.into());
+        match &mut self.auth.method {
+            AuthMethod::Legacy {
+                password: current, ..
+            } => *current = Some(password.into()),
+            AuthMethod::Agent(_) => self.auth = EndpointAuth::legacy(Some(password.into()), None),
+        }
         self
     }
 
     /// Set private key authentication (key content, not path)
     pub fn with_private_key(mut self, key: impl Into<String>) -> Self {
-        self.private_key = Some(key.into());
+        match &mut self.auth.method {
+            AuthMethod::Legacy { private_key, .. } => *private_key = Some(key.into()),
+            AuthMethod::Agent(_) => self.auth = EndpointAuth::legacy(None, Some(key.into())),
+        }
+        self
+    }
+
+    /// Configure agent-only authentication.
+    pub fn with_agent(mut self, agent: AgentAuth) -> Self {
+        let timeout = self.auth.timeout;
+        self.auth = EndpointAuth::agent(agent);
+        if timeout.is_some() {
+            self.auth.timeout = timeout;
+        }
+        self
+    }
+
+    /// Apply an explicit per-endpoint authentication budget.
+    pub fn with_auth_timeout(mut self, timeout: Duration) -> Self {
+        self.auth.timeout = Some(timeout);
         self
     }
 
@@ -231,12 +310,42 @@ mod tests {
         assert_eq!(config.host, "192.168.1.1");
         assert_eq!(config.port, 2222);
         assert_eq!(config.username, "admin");
-        assert_eq!(config.password, Some("secret".to_string()));
-        assert!(config.private_key.is_none());
+        assert!(
+            matches!(&config.auth.method, AuthMethod::Legacy { password: Some(password), private_key: None } if password == "secret")
+        );
         assert_eq!(config.reconnect_retries, 4);
         assert_eq!(config.reconnect_backoff_ms, 500);
         assert_eq!(config.health_probe_timeout_ms, 1_200);
         assert_eq!(config.host_key_checking, HostKeyCheckMode::AcceptNew);
         assert!(config.known_hosts.is_none());
+    }
+
+    #[test]
+    fn authentication_builders_preserve_legacy_precedence_and_budgets() {
+        let config = SshConfig::new("host", "user")
+            .with_private_key("key-secret")
+            .with_password("password-secret");
+        assert!(
+            matches!(&config.auth.method, AuthMethod::Legacy { password: Some(password), private_key: Some(key) } if password == "password-secret" && key == "key-secret")
+        );
+        assert_eq!(config.auth.timeout, None);
+        let debug = format!("{:?}", config.auth);
+        assert!(!debug.contains("password-secret"));
+        assert!(!debug.contains("key-secret"));
+        let agent = AgentAuth {
+            socket: "/agent/socket".into(),
+            identity: None,
+        };
+        let config = config.with_agent(agent.clone());
+        assert!(matches!(&config.auth.method, AuthMethod::Agent(current) if current == &agent));
+        assert_eq!(config.auth.timeout, Some(Duration::from_secs(90)));
+        let config = SshConfig::new("host", "user")
+            .with_auth_timeout(Duration::from_millis(123))
+            .with_agent(agent);
+        assert_eq!(config.auth.timeout, Some(Duration::from_millis(123)));
+        let config = SshConfig::new("host", "user")
+            .with_password("password")
+            .with_auth_timeout(Duration::from_millis(456));
+        assert_eq!(config.auth.timeout, Some(Duration::from_millis(456)));
     }
 }

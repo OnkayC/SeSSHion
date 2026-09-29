@@ -51,6 +51,8 @@ async fn test_fallback_from_rsync_to_sftp() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -189,6 +191,8 @@ async fn test_fallback_from_rsync_to_scp() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -329,6 +333,8 @@ async fn test_fallback_from_sftp_to_scp() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -459,6 +465,8 @@ async fn test_fallback_all_the_way_to_execraw() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -647,6 +655,8 @@ async fn test_fallback_stops_after_generic_error() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host: host.to_string(),
         port,
         user: "test".to_string(),

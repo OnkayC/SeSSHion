@@ -64,7 +64,7 @@ pub(super) fn transfer_tool() -> Tool {
                 "type": "string",
                 "enum": ["auto", "exec-raw", "sftp", "scp", "rsync"],
                 "default": "auto",
-                "description": "auto: rsync>sftp>scp>exec-raw; rsync/sftp/scp need keys on target+jump; exec-raw supports passwords."
+                "description": "auto: agent routes use exec-raw, else rsync>sftp>scp>exec-raw. rsync/sftp/scp need disk keys on both hops."
             },
             "kind": {
                 "type": "string",
@@ -209,18 +209,6 @@ mod tests {
         assert!(timeout_description.contains("Server-side"));
         assert!(timeout_description.contains("client deadline may expire earlier"));
         assert!(!timeout_description.contains("30s"));
-    }
-
-    #[test]
-    fn transfer_describes_fallback_and_key_requirements() {
-        let tool = transfer_tool();
-        let transport_description = tool.input_schema["properties"]["transport"]["description"]
-            .as_str()
-            .expect("transport description");
-
-        assert!(transport_description.contains("rsync>sftp>scp>exec-raw"));
-        assert!(transport_description.contains("rsync/sftp/scp need keys on target+jump"));
-        assert!(transport_description.contains("exec-raw supports passwords"));
     }
 
     #[test]

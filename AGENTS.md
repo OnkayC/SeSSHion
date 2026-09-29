@@ -26,9 +26,12 @@ SeSSHion is a lightweight Rust SSH Model Context Protocol (MCP) server for LLM a
  │   ├── logging_test.rs           # Logging configuration and initialization tests
  │   ├── compact_response_test.rs  # Compact response formatting and MCP protocol compliance
  │   ├── docker_integration_test.rs # Docker integration tests entry point
+ │   ├── yubikey_smoke.rs          # Ignored, explicitly opted-in physical agent smoke
+ │   ├── support/spy_agent.rs      # Isolated signing policy and request counters
  │   ├── docker_integration/       # Modular E2E tests using Docker containers
 │   │   ├── mod.rs                # Module exports
 │   │   ├── common.rs             # Shared test utilities and helpers
+│   │   ├── agent_tests.rs         # Agent, jump, transfer, and multi-process acceptance tests
 │   │   ├── check_process_tests.rs # Process monitoring tests
 │   │   ├── exec_raw_tests.rs     # ExecRaw transport tests
 │   │   ├── sftp_tests.rs         # SFTP transport tests
@@ -77,6 +80,7 @@ SeSSHion is a lightweight Rust SSH Model Context Protocol (MCP) server for LLM a
 │   ├── ssh/                    # SSH core logic
 │   │   ├── mod.rs              # SSH module definition
 │   │   ├── connection.rs       # SSH session, connection management, and slot semaphore helpers
+│   │   ├── agent.rs             # Native agent signer, identity selection, and endpoint deadline
 │   │   ├── command.rs          # Command execution over SSH
 │   │   ├── handler.rs          # SSH event handlers (russh implementation)
 │   │   ├── elevation.rs        # Privileged execution (su/sudo) logic

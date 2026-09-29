@@ -56,6 +56,8 @@ rustix = { version = "1", features = ["process"] }
 [dev-dependencies]
 testcontainers = "0.26.3"
 tempfile = "3.24"
+futures = "0.3"
+getrandom = { version = "0.4", features = ["sys_rng"] }
 anyhow = "1.0.100"
 nix = { version = "0.31", features = ["signal"] }
 tokio = { version = "1.49", features = ["full", "signal", "process", "io-util", "sync", "time"] }

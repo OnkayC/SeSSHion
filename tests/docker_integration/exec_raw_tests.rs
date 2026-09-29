@@ -28,6 +28,8 @@ async fn test_file_put(env: &TestEnvConfig, port: u16) {
 
     let host = std::net::Ipv4Addr::LOCALHOST.to_string();
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host,
         port,
         user: "test".to_string(),
@@ -124,6 +126,8 @@ async fn test_file_get(env: &TestEnvConfig, port: u16) {
 
     let host = std::net::Ipv4Addr::LOCALHOST.to_string();
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host,
         port,
         user: "test".to_string(),
@@ -239,6 +243,8 @@ async fn test_dir_put(env: &TestEnvConfig, port: u16) {
 
     let host = std::net::Ipv4Addr::LOCALHOST.to_string();
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host,
         port,
         user: "test".to_string(),
@@ -329,6 +335,8 @@ async fn test_dir_get(env: &TestEnvConfig, port: u16) {
 
     let host = std::net::Ipv4Addr::LOCALHOST.to_string();
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host,
         port,
         user: "test".to_string(),
@@ -541,6 +549,8 @@ async fn test_file_put_with_creds(env: &TestEnvConfig, port: u16, user: &str, pa
 
     let host = std::net::Ipv4Addr::LOCALHOST.to_string();
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host,
         port,
         user: user.to_string(),
@@ -637,6 +647,8 @@ async fn test_file_get_with_creds(env: &TestEnvConfig, port: u16, user: &str, pa
 
     let host = std::net::Ipv4Addr::LOCALHOST.to_string();
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host,
         port,
         user: user.to_string(),
@@ -746,6 +758,8 @@ async fn test_dir_put_with_creds(env: &TestEnvConfig, port: u16, user: &str, pas
 
     let host = std::net::Ipv4Addr::LOCALHOST.to_string();
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host,
         port,
         user: user.to_string(),
@@ -836,6 +850,8 @@ async fn test_dir_get_with_creds(env: &TestEnvConfig, port: u16, user: &str, pas
 
     let host = std::net::Ipv4Addr::LOCALHOST.to_string();
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host,
         port,
         user: user.to_string(),

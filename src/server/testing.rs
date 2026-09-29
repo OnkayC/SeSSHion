@@ -190,6 +190,16 @@ impl SshMcpServer {
         &self,
         params: crate::transfer::TransferParams,
     ) -> crate::transfer::TransferResponse {
+        self.test_transfer_with_cancellation(params, tokio_util::sync::CancellationToken::new())
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn test_transfer_with_cancellation(
+        &self,
+        params: crate::transfer::TransferParams,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> crate::transfer::TransferResponse {
         let timeout = params
             .timeout_ms
             .map(Duration::from_millis)
@@ -208,6 +218,12 @@ impl SshMcpServer {
                         port: self.config.port,
                         user: self.config.user.clone(),
                         key_path,
+                        agent_route: self.config.agent.is_some()
+                            || self
+                                .config
+                                .jump
+                                .as_ref()
+                                .is_some_and(|jump| jump.agent.is_some()),
                         host_key_checking: self.config.strict_host_key_checking,
                         known_hosts: self.config.known_hosts.clone(),
                         jump: self.config.jump.as_ref().map(|jump| TransferJumpOptions {
@@ -218,7 +234,7 @@ impl SshMcpServer {
                         }),
                     },
                 },
-                tokio_util::sync::CancellationToken::new(),
+                cancellation,
                 None,
             )
             .await

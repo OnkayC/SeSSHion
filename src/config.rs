@@ -2,10 +2,11 @@
 
 use clap::Parser;
 use std::ffi::OsStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SshMcpError};
-use crate::ssh::HostKeyCheckMode;
+use crate::ssh::{AgentAuth, HostKeyCheckMode};
 
 /// Default timeout for command execution in milliseconds
 pub const DEFAULT_TIMEOUT_MS: u64 = 300_000; // 300 seconds
@@ -67,6 +68,19 @@ pub struct Args {
     #[arg(long, env = "SSH_MCP_KEY")]
     pub key: Option<PathBuf>,
 
+    /// Authenticate exclusively through an SSH agent.
+    #[arg(long, default_value = "false", env = "SSH_MCP_AGENT")]
+    pub agent: bool,
+    /// Override the snapshotted SSH_AUTH_SOCK path.
+    #[arg(long, env = "SSH_MCP_AGENT_SOCKET")]
+    pub agent_socket: Option<PathBuf>,
+    /// Select a public key (.pub) loaded in the agent.
+    #[arg(long, env = "SSH_MCP_AGENT_IDENTITY")]
+    pub agent_identity: Option<PathBuf>,
+    /// Per-endpoint authentication budget in milliseconds (1..=600000).
+    #[arg(long, env = "SSH_MCP_AUTH_TIMEOUT_MS")]
+    pub auth_timeout_ms: Option<u64>,
+
     /// SSH jump host in USER@HOST[:PORT] form
     #[arg(long, env = "SSH_MCP_JUMP")]
     pub jump: Option<String>,
@@ -78,6 +92,14 @@ pub struct Args {
     /// SSH login password for the jump host
     #[arg(long, env = "SSH_MCP_JUMP_PASSWORD")]
     pub jump_password: Option<String>,
+
+    /// Authenticate the jump host exclusively through an SSH agent.
+    #[arg(long, default_value = "false", env = "SSH_MCP_JUMP_AGENT")]
+    pub jump_agent: bool,
+    #[arg(long, env = "SSH_MCP_JUMP_AGENT_SOCKET")]
+    pub jump_agent_socket: Option<PathBuf>,
+    #[arg(long, env = "SSH_MCP_JUMP_AGENT_IDENTITY")]
+    pub jump_agent_identity: Option<PathBuf>,
 
     /// Absolute local directory for background job logs and state
     #[arg(long, env = "SSH_MCP_SPOOL_DIR")]
@@ -182,6 +204,10 @@ pub struct Config {
     /// Path to SSH private key
     pub key: Option<PathBuf>,
 
+    /// Resolved agent-only authentication settings.
+    pub agent: Option<AgentAuth>,
+    pub auth_timeout_ms: Option<u64>,
+
     /// Optional SSH jump host and its independent credentials
     pub jump: Option<JumpConfig>,
 
@@ -233,16 +259,27 @@ pub struct JumpConfig {
     pub user: String,
     pub password: Option<String>,
     pub key: Option<PathBuf>,
+    pub agent: Option<AgentAuth>,
 }
 
 impl Config {
     /// Create Config from CLI Args
     pub fn from_args(args: Args) -> Result<Self> {
         let home = std::env::var_os("HOME");
-        Self::from_args_with_home(args, home.as_deref())
+        let auth_sock = std::env::var_os("SSH_AUTH_SOCK");
+        Self::from_args_with_env(args, home.as_deref(), auth_sock.as_deref())
     }
 
-    fn from_args_with_home(mut args: Args, home: Option<&OsStr>) -> Result<Self> {
+    #[cfg(test)]
+    fn from_args_with_home(args: Args, home: Option<&OsStr>) -> Result<Self> {
+        Self::from_args_with_env(args, home, None)
+    }
+
+    pub fn from_args_with_env(
+        mut args: Args,
+        home: Option<&OsStr>,
+        auth_sock: Option<&OsStr>,
+    ) -> Result<Self> {
         args.password = sanitize_password(args.password);
         args.jump_password = sanitize_password(args.jump_password);
         args.su_password = sanitize_password(args.su_password);
@@ -256,6 +293,20 @@ impl Config {
             .map(|path| expand_key_path(path, home))
             .transpose()?;
         validate_args(&args)?;
+        let agent = resolve_agent(
+            args.agent,
+            args.agent_socket,
+            args.agent_identity,
+            home,
+            auth_sock,
+        )?;
+        let jump_agent = resolve_agent(
+            args.jump_agent,
+            args.jump_agent_socket,
+            args.jump_agent_identity,
+            home,
+            auth_sock,
+        )?;
 
         let jump = args
             .jump
@@ -268,6 +319,7 @@ impl Config {
                 user,
                 password: args.jump_password,
                 key: args.jump_key,
+                agent: jump_agent,
             });
 
         let max_chars = parse_max_chars(args.max_chars.as_deref());
@@ -279,6 +331,8 @@ impl Config {
             user: args.user,
             password: args.password,
             key: args.key,
+            agent,
+            auth_timeout_ms: args.auth_timeout_ms,
             jump,
             su_password: args.su_password,
             sudo_password: args.sudo_password,
@@ -348,6 +402,81 @@ fn expand_key_path(path: PathBuf, home: Option<&OsStr>) -> Result<PathBuf> {
     Ok(Path::new(home).join(suffix))
 }
 
+fn resolve_agent(
+    enabled: bool,
+    socket: Option<PathBuf>,
+    identity: Option<PathBuf>,
+    home: Option<&OsStr>,
+    auth_sock: Option<&OsStr>,
+) -> Result<Option<AgentAuth>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let socket = socket.or_else(|| auth_sock.filter(|s| !s.is_empty()).map(PathBuf::from))
+        .filter(|s| !s.as_os_str().is_empty())
+        .ok_or_else(|| SshMcpError::Config("SSH-agent authentication requires --agent-socket (or --jump-agent-socket) or SSH_AUTH_SOCK".into()))?;
+    let socket = expand_key_path(socket, home)?;
+    let identity = identity
+        .map(|path| expand_key_path(path, home).and_then(|path| load_public_key_selector(&path)))
+        .transpose()?;
+    Ok(Some(AgentAuth { socket, identity }))
+}
+
+/// Load exactly one ordinary OpenSSH public key without reading unbounded input.
+pub fn load_public_key_selector(path: &Path) -> Result<russh::keys::PublicKey> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        SshMcpError::Config(format!(
+            "Cannot open public key selector {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            SshMcpError::Config(format!(
+                "Cannot read public key selector {}: {error}",
+                path.display()
+            ))
+        })?;
+    if bytes.len() > 16 * 1024 {
+        return Err(SshMcpError::Config(
+            "Public key selector exceeds 16 KiB".into(),
+        ));
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        SshMcpError::Config("Public key selector must be UTF-8 OpenSSH public key text".into())
+    })?;
+    if text.contains("PRIVATE KEY") {
+        return Err(SshMcpError::Config(
+            "This option takes a public key (.pub), not a private key".into(),
+        ));
+    }
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+    let line = lines.next().ok_or_else(|| {
+        SshMcpError::Config("Public key selector must contain exactly one public key".into())
+    })?;
+    if lines.next().is_some() {
+        return Err(SshMcpError::Config(
+            "Public key selector must contain exactly one public key".into(),
+        ));
+    }
+    if line
+        .split_whitespace()
+        .next()
+        .is_some_and(|algorithm| algorithm.ends_with("-cert-v01@openssh.com"))
+    {
+        return Err(SshMcpError::Config(
+            "Certificate selectors are not supported in this release".into(),
+        ));
+    }
+    russh::keys::PublicKey::from_openssh(line)
+        .map_err(|_| SshMcpError::Config("Invalid OpenSSH public key selector".into()))
+}
+
 /// Validate CLI arguments
 fn validate_args(args: &Args) -> Result<()> {
     let mut errors = Vec::new();
@@ -360,35 +489,55 @@ fn validate_args(args: &Args) -> Result<()> {
         errors.push("Missing required --user".to_string());
     }
 
-    // Must have either password or key
-    if args.password.is_none() && args.key.is_none() {
-        errors.push("Must provide either --password or --key".to_string());
+    if !args.agent && args.password.is_none() && args.key.is_none() {
+        errors.push("Must provide --password, --key, or --agent".into());
     }
-
-    match (
-        args.jump.is_some(),
-        args.jump_key.is_some(),
-        args.jump_password.is_some(),
-    ) {
-        (false, false, false) | (true, true, false) | (true, false, true) => {}
-        (false, _, _) => errors.push("Jump credentials require --jump".to_string()),
-        (true, false, false) => {
-            errors.push("--jump requires exactly one of --jump-key or --jump-password".to_string())
-        }
-        (true, true, true) => errors.push(
-            "--jump-key and --jump-password are mutually exclusive; provide exactly one"
-                .to_string(),
-        ),
+    if args.agent && args.password.is_some() {
+        errors.push("--agent conflicts with --password / SSH_MCP_PASSWORD".into());
+    }
+    if args.agent && args.key.is_some() {
+        errors.push("--agent conflicts with --key / SSH_MCP_KEY".into());
+    }
+    if !args.agent && (args.agent_socket.is_some() || args.agent_identity.is_some()) {
+        errors.push("--agent-socket and --agent-identity require --agent".into());
+    }
+    let jump_credentials = usize::from(args.jump_key.is_some())
+        + usize::from(args.jump_password.is_some())
+        + usize::from(args.jump_agent);
+    if args.jump.is_none()
+        && (jump_credentials > 0
+            || args.jump_agent_socket.is_some()
+            || args.jump_agent_identity.is_some())
+    {
+        errors.push("Jump credentials require --jump".into());
+    } else if args.jump.is_some() && jump_credentials != 1 {
+        errors.push("--jump requires exactly one of --jump-key / SSH_MCP_JUMP_KEY, --jump-password / SSH_MCP_JUMP_PASSWORD, or --jump-agent".into());
+    }
+    if !args.jump_agent && (args.jump_agent_socket.is_some() || args.jump_agent_identity.is_some())
+    {
+        errors.push("--jump-agent-socket and --jump-agent-identity require --jump-agent".into());
+    }
+    if args
+        .auth_timeout_ms
+        .is_some_and(|value| !(1..=600_000).contains(&value))
+    {
+        errors.push("--auth-timeout-ms must be between 1 and 600000".into());
+    }
+    #[cfg(not(unix))]
+    if args.agent || args.jump_agent {
+        errors.push("SSH-agent authentication requires a Unix-domain socket (not available on this platform)".into());
     }
 
     // If key is provided, check if file exists
-    if let Some(ref key_path) = args.key
+    if !args.agent
+        && let Some(key_path) = &args.key
         && !key_path.exists()
     {
         errors.push(format!("SSH key file not found: {}", key_path.display()));
     }
 
-    if let Some(ref key_path) = args.jump_key
+    if !args.jump_agent
+        && let Some(key_path) = &args.jump_key
         && !key_path.exists()
     {
         errors.push(format!(
@@ -504,6 +653,13 @@ mod tests {
             user: "test".to_string(),
             password: Some("secret".to_string()),
             key: None,
+            agent: false,
+            agent_socket: None,
+            agent_identity: None,
+            auth_timeout_ms: None,
+            jump_agent: false,
+            jump_agent_socket: None,
+            jump_agent_identity: None,
             jump: None,
             jump_key: None,
             jump_password: None,
@@ -604,6 +760,7 @@ mod tests {
                 user: "jump-user".to_string(),
                 password: None,
                 key: Some(key_path),
+                agent: None,
             })
         );
     }
@@ -781,5 +938,191 @@ mod tests {
 
         let result = validate_args(&args);
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn agent_authentication_is_rejected_on_non_unix_platforms() {
+        let mut args = base_args();
+        args.password = None;
+        args.agent = true;
+        args.agent_socket = Some("agent.sock".into());
+        let error = Config::from_args_with_env(args, None, None).unwrap_err();
+        assert!(error.to_string().contains("Unix-domain socket"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn authentication_matrices_and_timeout_boundaries() {
+        let key = tempfile::NamedTempFile::new().unwrap();
+        for agent in [false, true] {
+            for password in [false, true] {
+                for private_key in [false, true] {
+                    let mut args = base_args();
+                    args.agent = agent;
+                    args.password = password.then(|| "secret".into());
+                    args.key = private_key.then(|| key.path().to_path_buf());
+                    let valid = if agent {
+                        !password && !private_key
+                    } else {
+                        password || private_key
+                    };
+                    assert_eq!(
+                        validate_args(&args).is_ok(),
+                        valid,
+                        "target: {agent}/{password}/{private_key}"
+                    );
+                    for jump in [false, true] {
+                        args = base_args();
+                        args.jump = jump.then(|| "user@jump".into());
+                        args.jump_agent = agent;
+                        args.jump_password = password.then(|| "secret".into());
+                        args.jump_key = private_key.then(|| key.path().to_path_buf());
+                        let count =
+                            usize::from(agent) + usize::from(password) + usize::from(private_key);
+                        assert_eq!(
+                            validate_args(&args).is_ok(),
+                            if jump { count == 1 } else { count == 0 },
+                            "jump: {jump}/{agent}/{password}/{private_key}"
+                        );
+                    }
+                }
+            }
+        }
+        for (budget, valid) in [(0, false), (1, true), (600_000, true), (600_001, false)] {
+            let mut args = base_args();
+            args.auth_timeout_ms = Some(budget);
+            assert_eq!(validate_args(&args).is_ok(), valid);
+        }
+        for jump in [false, true] {
+            let mut args = base_args();
+            if jump {
+                args.jump_agent_identity = Some("selector.pub".into());
+            } else {
+                args.agent_socket = Some("socket".into());
+            }
+            assert!(validate_args(&args).is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sockets_are_snapshotted_and_endpoints_independent() {
+        let mut args = base_args();
+        args.password = None;
+        args.agent = true;
+        args.agent_socket = Some("~/target.sock".into());
+        args.jump = Some("jump@host".into());
+        args.jump_agent = true;
+        let config = Config::from_args_with_env(
+            args,
+            Some(OsStr::new("/home/test")),
+            Some(OsStr::new("/env/socket")),
+        )
+        .unwrap();
+        assert_eq!(
+            config.agent.unwrap().socket,
+            PathBuf::from("/home/test/target.sock")
+        );
+        assert_eq!(
+            config.jump.unwrap().agent.unwrap().socket,
+            PathBuf::from("/env/socket")
+        );
+        let mut args = base_args();
+        args.password = None;
+        args.agent = true;
+        assert!(
+            Config::from_args_with_env(args, None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("SSH_AUTH_SOCK")
+        );
+    }
+
+    #[test]
+    fn selectors_reject_unsafe_and_ambiguous_input() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        for (text, expected) in [
+            (
+                "-----BEGIN OPENSSH PRIVATE KEY-----".to_string(),
+                "public key (.pub)",
+            ),
+            (
+                "ssh-ed25519 garbage\nssh-ed25519 garbage".to_string(),
+                "exactly one",
+            ),
+            (
+                "ssh-ed25519-cert-v01@openssh.com garbage".to_string(),
+                "Certificate selectors",
+            ),
+            ("garbage".to_string(), "Invalid OpenSSH"),
+            ("# comment\n\n".to_string(), "exactly one"),
+            ("x".repeat(16 * 1024 + 1), "exceeds 16 KiB"),
+        ] {
+            std::fs::write(file.path(), text).unwrap();
+            assert!(
+                load_public_key_selector(file.path())
+                    .unwrap_err()
+                    .to_string()
+                    .contains(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn selectors_accept_public_key_algorithms_and_comments() {
+        for algorithm in [
+            russh::keys::Algorithm::Ed25519,
+            russh::keys::Algorithm::Ecdsa {
+                curve: russh::keys::ssh_key::EcdsaCurve::NistP256,
+            },
+            russh::keys::Algorithm::Rsa { hash: None },
+        ] {
+            let key = russh::keys::PrivateKey::random(
+                &mut getrandom::rand_core::UnwrapErr(getrandom::SysRng),
+                algorithm,
+            )
+            .unwrap();
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let public = key.public_key().to_openssh().unwrap();
+            std::fs::write(file.path(), format!("# selection\n\n{public}\n")).unwrap();
+            assert_eq!(
+                load_public_key_selector(file.path()).unwrap().key_data(),
+                key.public_key().key_data()
+            );
+        }
+    }
+
+    #[test]
+    fn false_agent_environment_is_disabled() {
+        const CHILD: &str = "SESSHION_CONFIG_ENV_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let args = Args::try_parse_from([
+                "ssh-mcp",
+                "--host",
+                "host",
+                "--user",
+                "user",
+                "--password",
+                "secret",
+            ])
+            .unwrap();
+            assert!(!args.agent);
+            assert!(!args.jump_agent);
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::false_agent_environment_is_disabled",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(CHILD, "1")
+            .env("SSH_MCP_AGENT", "false")
+            .env("SSH_MCP_JUMP_AGENT", "false")
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }

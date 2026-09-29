@@ -3205,6 +3205,7 @@ version = "5.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "futures",
  "getrandom 0.4.3",
  "nix",
  "rmcp",

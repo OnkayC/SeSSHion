@@ -35,6 +35,11 @@ pub fn init_logging(args: &Args) -> Result<Option<WorkerGuard>> {
     // Create env filter (respect RUST_LOG, fall back to args.log_level)
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
+    // russh 0.61.2 logs raw agent frames and signing payloads at debug.
+    // Keep this independent of RUST_LOG so verbose diagnostics cannot expose them.
+    let agent_filter = tracing_subscriber::filter::Targets::new()
+        .with_default(tracing::Level::TRACE)
+        .with_target("russh::keys::agent", tracing::Level::INFO);
 
     // Set up file layer if log_file is specified
     let (file_writer, guard) = if let Some(log_file) = &args.log_file {
@@ -45,7 +50,7 @@ pub fn init_logging(args: &Args) -> Result<Option<WorkerGuard>> {
     };
 
     // Build subscriber with stderr (text) and optionally file (text or JSON)
-    let registry = Registry::default().with(env_filter);
+    let registry = Registry::default().with(env_filter).with(agent_filter);
 
     // Always add stderr layer (text format only - stdout reserved for MCP protocol)
     let stderr_layer = fmt::layer().with_target(false).with_writer(std::io::stderr);

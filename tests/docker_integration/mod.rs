@@ -1,5 +1,6 @@
 //! Module exports for docker_integration tests
 
+pub mod agent_tests;
 pub mod auth_tests;
 pub mod check_process_tests;
 pub mod common;

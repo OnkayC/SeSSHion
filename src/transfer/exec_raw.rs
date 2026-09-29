@@ -166,7 +166,8 @@ pub async fn put_file_exec_raw(
              if ! (mkdir -p -- "$parent" 2>/dev/null && (set -C; : > "$sib") 2>/dev/null); then \
                 if [ -e "$sib" ]; then printf "%s\\n" "{ERR_MARKER}staging_collision" >&2; else printf "%s\\n" "{ERR_MARKER}staging_unwritable" >&2; fi; exit 1; \
                fi; \
-             trap "rm -f -- \"$stage\" 2>/dev/null || true" EXIT; \
+             cleanup() {{ rm -f -- "$stage" 2>/dev/null || true; }}; \
+             trap cleanup EXIT; trap "exit 1" HUP INT TERM; \
                printf "%s\\n" "{STAGE_MARKER}$stage" >&2; \
                printf "%s\\n" "{STAGE_BASE_MARKER}$stage_base" >&2; \
                 cat > "$stage"; actual=$(wc -c < "$stage"); if [ "$actual" -ne "$expected" ]; then printf "%s\\n" "{ERR_MARKER}size_mismatch:$actual:$expected" >&2; exit 1; fi; \
@@ -179,7 +180,8 @@ pub async fn put_file_exec_raw(
             r#"sh -c 'set -eu; parent=$1; dst=$2; sib=$3; expected=$4; \
              if ! (mkdir -p -- "$parent" 2>/dev/null && (set -C; : > "$sib") 2>/dev/null); then \
                   if [ -e "$sib" ]; then printf "%s\\n" "{ERR_MARKER}staging_collision" >&2; else printf "%s\\n" "{ERR_MARKER}staging_unwritable" >&2; fi; exit 1; fi; \
-                trap "rm -f -- \"$sib\" 2>/dev/null || true" EXIT; \
+                cleanup() {{ rm -f -- "$sib" 2>/dev/null || true; }}; \
+                trap cleanup EXIT; trap "exit 1" HUP INT TERM; \
                 printf "%s\\n" "{STAGE_MARKER}$sib" >&2; \
                 printf "%s\\n" "{STAGE_BASE_MARKER}$parent" >&2; \
                 cat > "$sib"; actual=$(wc -c < "$sib"); if [ "$actual" -ne "$expected" ]; then printf "%s\\n" "{ERR_MARKER}size_mismatch:$actual:$expected" >&2; exit 1; fi; \
@@ -330,21 +332,29 @@ pub async fn put_dir_exec_raw(
         // Use sibling staging so the final rename stays on one filesystem.
         format!(
             r#"sh -c 'set -eu; parent=$1; dst=$2; stage_sib=$3; backup_sib=$4; \
-              stage="$stage_sib"; stage_base="$parent"; \
+              stage="$stage_sib"; stage_base="$parent"; backup="$backup_sib"; backup_owned=0; \
              if ! (mkdir -p -- "$parent" 2>/dev/null && mkdir -- "$stage_sib" 2>/dev/null); then \
                if [ -e "$stage_sib" ]; then printf "%s\\n" "{ERR_MARKER}staging_collision" >&2; else printf "%s\\n" "{ERR_MARKER}staging_unwritable" >&2; fi; exit 1; \
                fi; \
-             trap "rm -rf -- \"$stage\" 2>/dev/null || true" EXIT; \
+             cleanup() {{ \
+               if [ "$backup_owned" -eq 1 ] && [ -e "$backup" ]; then \
+                 if [ ! -e "$dst" ]; then mv -- "$backup" "$dst" 2>/dev/null || true; \
+                 elif [ ! -e "$stage" ]; then rm -rf -- "$backup" 2>/dev/null || true; fi; \
+               fi; \
+               rm -rf -- "$stage" 2>/dev/null || true; \
+             }}; \
+             trap cleanup EXIT; trap "exit 1" HUP INT TERM; \
                printf "%s\\n" "{STAGE_MARKER}$stage" >&2; \
                printf "%s\\n" "{STAGE_BASE_MARKER}$stage_base" >&2; \
                {tar_extract}; \
-               had_dst=0; backup="$backup_sib"; \
+               had_dst=0; \
               if [ -e "$dst" ]; then \
                 if [ -e "$backup" ]; then printf "%s\\n" "{ERR_MARKER}backup_collision" >&2; exit 1; fi; \
+                backup_owned=1; \
                 if ! mv -- "$dst" "$backup"; then printf "%s\\n" "{ERR_MARKER}backup_failed" >&2; exit 1; fi; had_dst=1; \
               fi; \
                printf "%s\\n" "{BACKUP_MARKER}$backup" >&2; \
-              if mv -- "$stage" "$dst"; then trap - EXIT; if [ "$had_dst" -eq 1 ]; then rm -rf -- "$backup" 2>/dev/null || true; fi; exit 0; fi; \
+              if mv -- "$stage" "$dst"; then if [ "$had_dst" -eq 1 ]; then rm -rf -- "$backup" 2>/dev/null || true; fi; trap - EXIT HUP INT TERM; exit 0; fi; \
                if [ "$had_dst" -eq 1 ] && ! mv -- "$backup" "$dst"; then printf "%s\\n" "{ERR_MARKER}rollback_failed:$backup" >&2; else printf "%s\\n" "{ERR_MARKER}install_failed" >&2; fi; exit 1' sh '{parent_escaped}' '{dst_escaped}' '{stage_sib_escaped}' '{backup_sib_escaped}'"#
         )
     } else {
@@ -356,7 +366,8 @@ pub async fn put_dir_exec_raw(
               if ! mkdir -- "$dst" 2>/dev/null; then \
                  if [ -e "$dst" ]; then printf "%s\\n" "{ERR_MARKER}destination_exists" >&2; else printf "%s\\n" "{ERR_MARKER}mkdir_failed" >&2; fi; \
                  exit 1; fi; \
-              trap "rm -rf -- \"$dst\" 2>/dev/null || true" EXIT; \
+              cleanup() {{ rm -rf -- "$dst" 2>/dev/null || true; }}; \
+              trap cleanup EXIT; trap "exit 1" HUP INT TERM; \
                printf "%s\\n" "{STAGE_MARKER}$dst" >&2; \
                printf "%s\\n" "{STAGE_BASE_MARKER}$parent" >&2; \
                {tar_extract}; trap - EXIT' sh '{parent_escaped}' '{dst_escaped}'"#
@@ -380,35 +391,33 @@ pub async fn put_dir_exec_raw(
         )
         .await;
 
-    let tar_res: Result<tar::TarCounts> = match tar_task.await {
-        Ok(res) => res,
-        Err(e) => Err(SshMcpError::connection(format!(
-            "tar writer task failed: {e}"
-        ))),
-    };
-
     let exec_out = match exec_res {
         Ok(out) => out,
         Err(exec_err) => {
-            if let Err(tar_err) = tar_res {
-                return Err(SshMcpError::connection(format!(
-                    "put_dir failed: {exec_err}; additionally tar encoder failed: {tar_err}"
-                )));
-            }
+            // Stop the encoder before waiting: its duplex reader is no longer pumped
+            // and a large archive could otherwise keep the cancelled transfer alive.
+            drop(rx);
+            tar_task.abort();
+            let _ = tar_task.await;
             return Err(exec_err);
         }
     };
 
     if let Err(remote_err) = ensure_remote_success("put_dir", &exec_out) {
-        if let Err(tar_err) = tar_res {
-            return Err(SshMcpError::connection(format!(
-                "put_dir failed: {remote_err}; additionally tar encoder failed: {tar_err}"
-            )));
-        }
+        drop(rx);
+        tar_task.abort();
+        let _ = tar_task.await;
         return Err(remote_err);
     }
 
-    let tar_counts = tar_res?;
+    let tar_counts = match tar_task.await {
+        Ok(res) => res?,
+        Err(e) => {
+            return Err(SshMcpError::connection(format!(
+                "tar writer task failed: {e}"
+            )));
+        }
+    };
 
     if let Some(progress) = args.ctx.progress {
         progress.emit(TransferEvent::Finalizing);

@@ -3,8 +3,8 @@
 //! Provides persistent SSH connection handling with automatic reconnection,
 //! concurrent access protection, and optional privilege elevation via `su`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use russh::Channel;
@@ -14,8 +14,8 @@ use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
-use super::config::SshConfig;
-use super::handler::SshHandler;
+use super::config::{AuthMethod, EndpointAuth, SshConfig};
+use super::handler::{KeyCheckOutcome, SshHandler};
 use crate::config::CONNECTION_TIMEOUT_SECS;
 use crate::error::{Result, SshMcpError};
 use russh::ChannelMsg;
@@ -27,9 +27,76 @@ const MAX_RECONNECT_BACKOFF_MS: u64 = 30_000;
 const MIN_HEALTH_PROBE_TTL_MS: u64 = 250;
 const MAX_HEALTH_PROBE_TTL_MS: u64 = 5_000;
 
+type ClassifiedResult<T> = std::result::Result<T, ConnectError>;
+
+struct ConnectError {
+    error: SshMcpError,
+    retryable: bool,
+}
+
+impl ConnectError {
+    fn terminal(error: SshMcpError) -> Self {
+        Self {
+            error,
+            retryable: false,
+        }
+    }
+}
+
+impl From<SshMcpError> for ConnectError {
+    fn from(error: SshMcpError) -> Self {
+        let retryable = !matches!(error, SshMcpError::Config(_));
+        Self { error, retryable }
+    }
+}
+
+impl Clone for ConnectError {
+    fn clone(&self) -> Self {
+        // The public error type is stable. Clone its value only when sharing an
+        // attempt outcome with concurrent callers.
+        let error = match &self.error {
+            SshMcpError::Connection(message) => SshMcpError::Connection(message.clone()),
+            SshMcpError::Authentication(message) => SshMcpError::Authentication(message.clone()),
+            SshMcpError::Timeout(value) => SshMcpError::Timeout(*value),
+            SshMcpError::InvalidParams(message) => SshMcpError::InvalidParams(message.clone()),
+            SshMcpError::ElevationFailed(message) => SshMcpError::ElevationFailed(message.clone()),
+            SshMcpError::Config(message) => SshMcpError::Config(message.clone()),
+            SshMcpError::Io(error) => {
+                SshMcpError::Io(std::io::Error::new(error.kind(), error.to_string()))
+            }
+            SshMcpError::SshKey(message) => SshMcpError::SshKey(message.clone()),
+        };
+        Self {
+            error,
+            retryable: self.retryable,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ConnectAttempt {
+    outcome: StdMutex<Option<ClassifiedResult<()>>>,
+    notify: Notify,
+}
+
+impl ConnectAttempt {
+    async fn wait(&self) -> ClassifiedResult<()> {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(outcome) = self.outcome.lock().expect("connect outcome lock").clone() {
+                return outcome;
+            }
+            notified.await;
+        }
+    }
+}
+
 struct ConnectAttemptGuard<'a> {
     is_connecting: &'a AtomicBool,
-    connect_notify: &'a Notify,
+    active: &'a StdMutex<Option<Arc<ConnectAttempt>>>,
+    attempt: Arc<ConnectAttempt>,
 }
 
 struct ActiveRoute {
@@ -39,8 +106,16 @@ struct ActiveRoute {
 
 impl Drop for ConnectAttemptGuard<'_> {
     fn drop(&mut self) {
+        let mut active = self.active.lock().expect("active connect attempt lock");
+        let mut outcome = self.attempt.outcome.lock().expect("connect outcome lock");
+        if outcome.is_none() {
+            *outcome = Some(Err(ConnectError::terminal(SshMcpError::connection(
+                "Connection attempt cancelled",
+            ))));
+        }
+        *active = None;
         self.is_connecting.store(false, Ordering::SeqCst);
-        self.connect_notify.notify_waiters();
+        self.attempt.notify.notify_waiters();
     }
 }
 
@@ -65,8 +140,8 @@ pub struct SshConnectionManager {
     /// Terminal gate preventing new SSH work after shutdown begins.
     shutting_down: AtomicBool,
 
-    /// Notification for waiters when connection attempt completes
-    connect_notify: Arc<Notify>,
+    /// Current owner attempt; waiters retain its outcome after it finishes.
+    connect_attempt: StdMutex<Option<Arc<ConnectAttempt>>>,
 
     /// Elevated shell channel (when using su)
     /// Made pub(crate) to allow access from command.rs
@@ -101,7 +176,7 @@ impl SshConnectionManager {
             session: Arc::new(Mutex::new(None)),
             is_connecting: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
-            connect_notify: Arc::new(Notify::new()),
+            connect_attempt: StdMutex::new(None),
             su_channel: Arc::new(Mutex::new(None)),
             is_elevated: AtomicBool::new(false),
             has_timeout_cmd: AtomicBool::new(false),
@@ -142,49 +217,58 @@ impl SshConnectionManager {
     /// If already connected, returns immediately. If another task is currently
     /// connecting, waits for that connection attempt to complete.
     pub async fn connect(&self) -> Result<()> {
+        self.connect_classified().await.map_err(|error| error.error)
+    }
+
+    async fn connect_classified(&self) -> ClassifiedResult<()> {
         self.ensure_not_shutting_down()?;
 
-        // Check if already connected
-        if self.is_connected().await {
+        if let Ok(session) = self.session.try_lock()
+            && session.is_some()
+        {
             debug!("Already connected to SSH server");
             return Ok(());
         }
 
-        // Register before inspecting the flag so completion cannot race the waiter.
-        let notified = self.connect_notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-
-        // Prevent concurrent connection attempts
-        if self
-            .is_connecting
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            debug!("Another connection attempt in progress, waiting...");
-            // Every establishment phase has its own timeout. Waiting for the
-            // guarded owner avoids a shorter guessed timeout for multi-hop routes.
-            notified.await;
-            return if self.is_shutting_down() {
-                self.ensure_not_shutting_down()
-            } else if self.is_connected().await {
-                Ok(())
+        let (attempt, owner) = {
+            let mut active = self
+                .connect_attempt
+                .lock()
+                .expect("active connect attempt lock");
+            if let Some(attempt) = active.as_ref() {
+                (Arc::clone(attempt), false)
             } else {
-                Err(SshMcpError::connection("Connection failed by another task"))
-            };
+                let attempt = Arc::new(ConnectAttempt::default());
+                *active = Some(Arc::clone(&attempt));
+                self.is_connecting.store(true, Ordering::SeqCst);
+                (attempt, true)
+            }
+        };
+        if !owner {
+            debug!("Another connection attempt in progress, waiting...");
+            // Share the owner's classification, so waiters cannot turn an
+            // agent refusal into their own reconnect/signing loop.
+            return attempt.wait().await;
         }
 
-        // Cancellation must release the owner flag and wake waiters.
         let _attempt_guard = ConnectAttemptGuard {
             is_connecting: &self.is_connecting,
-            connect_notify: self.connect_notify.as_ref(),
+            active: &self.connect_attempt,
+            attempt: Arc::clone(&attempt),
         };
-
-        self.do_connect().await
+        // A previous owner may have published a route between the first check
+        // and acquiring the owner slot.
+        let outcome = if self.is_connected().await {
+            Ok(())
+        } else {
+            self.do_connect().await
+        };
+        *attempt.outcome.lock().expect("connect outcome lock") = Some(outcome.clone());
+        outcome
     }
 
     /// Internal connection logic.
-    async fn do_connect(&self) -> Result<()> {
+    async fn do_connect(&self) -> ClassifiedResult<()> {
         info!(
             "Connecting to SSH server {}:{}...",
             self.config.host, self.config.port
@@ -215,13 +299,12 @@ impl SshConnectionManager {
             if let Err(error) = Self::authenticate_session(
                 &mut jump,
                 &jump_config.username,
-                jump_config.password.as_deref(),
-                jump_config.private_key.as_deref(),
+                &jump_config.auth,
                 "jump authentication",
             )
             .await
             {
-                Self::disconnect_handle(jump).await;
+                drop(jump);
                 return Err(error);
             }
 
@@ -241,18 +324,23 @@ impl SshConnectionManager {
                     Self::disconnect_handle(jump).await;
                     return Err(SshMcpError::connection(format!(
                         "jump forwarding failed: {error}"
-                    )));
+                    ))
+                    .into());
                 }
                 Err(_) => {
                     Self::disconnect_handle(jump).await;
                     return Err(SshMcpError::connection(format!(
                         "jump forwarding timed out after {}s",
                         CONNECTION_TIMEOUT_SECS
-                    )));
+                    ))
+                    .into());
                 }
             };
 
-            let target_handler = self.target_handler();
+            let key_outcome = Arc::new(StdMutex::new(None));
+            let target_handler = self
+                .target_handler()
+                .with_key_check_outcome(Arc::clone(&key_outcome));
             let target = match timeout(
                 connection_timeout,
                 client::connect_stream(ssh_config.clone(), tunnel.into_stream(), target_handler),
@@ -262,16 +350,20 @@ impl SshConnectionManager {
                 Ok(Ok(session)) => session,
                 Ok(Err(error)) => {
                     Self::disconnect_handle(jump).await;
-                    return Err(SshMcpError::connection(format!(
-                        "target connection through jump failed: {error}"
-                    )));
+                    return Err(Self::transport_error(
+                        SshMcpError::connection(format!(
+                            "target connection through jump failed: {error}"
+                        )),
+                        &key_outcome,
+                    ));
                 }
                 Err(_) => {
                     Self::disconnect_handle(jump).await;
                     return Err(SshMcpError::connection(format!(
                         "target connection through jump timed out after {}s",
                         CONNECTION_TIMEOUT_SECS
-                    )));
+                    ))
+                    .into());
                 }
             };
             (target, Some(jump))
@@ -307,14 +399,16 @@ impl SshConnectionManager {
         port: u16,
         stage: &str,
         connection_timeout: Duration,
-    ) -> Result<Handle<SshHandler>> {
+    ) -> ClassifiedResult<Handle<SshHandler>> {
         let addr = format!("{host}:{port}");
+        let key_outcome = Arc::new(StdMutex::new(None));
         let handler = SshHandler::new(
             host.to_string(),
             port,
             self.config.host_key_checking,
             self.config.known_hosts.clone(),
-        );
+        )
+        .with_key_check_outcome(Arc::clone(&key_outcome));
         timeout(
             connection_timeout,
             client::connect(ssh_config.clone(), &addr, handler),
@@ -326,7 +420,27 @@ impl SshConnectionManager {
                 CONNECTION_TIMEOUT_SECS
             ))
         })?
-        .map_err(|error| SshMcpError::connection(format!("{stage} failed: {error}")))
+        .map_err(|error| {
+            Self::transport_error(
+                SshMcpError::connection(format!("{stage} failed: {error}")),
+                &key_outcome,
+            )
+        })
+    }
+
+    fn transport_error(
+        error: SshMcpError,
+        key_outcome: &StdMutex<Option<KeyCheckOutcome>>,
+    ) -> ConnectError {
+        let rejected = matches!(
+            *key_outcome.lock().expect("host key outcome lock"),
+            Some(KeyCheckOutcome::KeyChanged | KeyCheckOutcome::UnknownRejected)
+        );
+        if rejected {
+            ConnectError::terminal(error)
+        } else {
+            error.into()
+        }
     }
 
     /// Authenticate, store the session, and optionally elevate.
@@ -334,17 +448,20 @@ impl SshConnectionManager {
         &self,
         mut target: Handle<SshHandler>,
         jump: Option<Handle<SshHandler>>,
-    ) -> Result<()> {
+    ) -> ClassifiedResult<()> {
         if let Err(error) = Self::authenticate_session(
             &mut target,
             &self.config.username,
-            self.config.password.as_deref(),
-            self.config.private_key.as_deref(),
+            &self.config.auth,
             "target authentication",
         )
         .await
         {
-            Self::disconnect_route(ActiveRoute { target, jump }).await;
+            // russh's signing loop ignores disconnect messages while waiting
+            // for Msg::Signed. Dropping the unauthenticated handle closes that
+            // receiver and releases the session task instead.
+            drop(target);
+            drop(jump);
             return Err(error);
         }
 
@@ -358,7 +475,7 @@ impl SshConnectionManager {
         }
         if let Some(route) = route {
             Self::disconnect_route(route).await;
-            return self.ensure_not_shutting_down();
+            return self.ensure_not_shutting_down().map_err(Into::into);
         }
         {
             let mut probe_guard = self.last_health_probe_ok_at.lock().await;
@@ -385,22 +502,65 @@ impl SshConnectionManager {
     async fn authenticate_session(
         session: &mut Handle<SshHandler>,
         username: &str,
+        auth: &EndpointAuth,
+        stage: &str,
+    ) -> ClassifiedResult<()> {
+        match &auth.method {
+            AuthMethod::Agent(agent) => super::agent::authenticate(
+                session,
+                username,
+                agent,
+                auth.timeout.unwrap_or(Duration::from_secs(90)),
+                stage,
+            )
+            .await
+            .map_err(ConnectError::terminal),
+            AuthMethod::Legacy {
+                password,
+                private_key,
+            } => {
+                let authentication = Self::authenticate_legacy(
+                    session,
+                    username,
+                    password.as_deref(),
+                    private_key.as_deref(),
+                    stage,
+                    auth.timeout.is_none(),
+                );
+                if let Some(budget) = auth.timeout {
+                    timeout(budget, authentication)
+                        .await
+                        .map_err(|_| {
+                            ConnectError::from(SshMcpError::auth(format!(
+                                "{stage} timed out after {} ms waiting for server reply",
+                                budget.as_millis()
+                            )))
+                        })?
+                        .map_err(Into::into)
+                } else {
+                    authentication.await.map_err(Into::into)
+                }
+            }
+        }
+    }
+
+    async fn authenticate_legacy(
+        session: &mut Handle<SshHandler>,
+        username: &str,
         password: Option<&str>,
         private_key: Option<&str>,
         stage: &str,
+        per_request_timeout: bool,
     ) -> Result<()> {
         // Try password authentication first
         if let Some(password) = password {
             debug!("Attempting {stage} with password for user '{username}'");
-            let auth_result = timeout(
-                Duration::from_secs(AUTH_TIMEOUT_SECS),
+            let auth_result = Self::legacy_auth_request(
                 session.authenticate_password(username, password),
+                stage,
+                per_request_timeout,
             )
-            .await
-            .map_err(|_| {
-                SshMcpError::auth(format!("{stage} timed out after {}s", AUTH_TIMEOUT_SECS))
-            })?
-            .map_err(|error| SshMcpError::auth(format!("{stage} failed: {error}")))?;
+            .await?;
 
             if auth_result.success() {
                 info!("{stage} with password successful");
@@ -437,15 +597,12 @@ impl SshConnectionManager {
 
                 let key_with_alg = PrivateKeyWithHashAlg::new(Arc::clone(&key), *hash_alg);
 
-                let auth_result = timeout(
-                    Duration::from_secs(AUTH_TIMEOUT_SECS),
+                let auth_result = Self::legacy_auth_request(
                     session.authenticate_publickey(username, key_with_alg),
+                    stage,
+                    per_request_timeout,
                 )
-                .await
-                .map_err(|_| {
-                    SshMcpError::auth(format!("{stage} timed out after {}s", AUTH_TIMEOUT_SECS))
-                })?
-                .map_err(|error| SshMcpError::auth(format!("{stage} failed: {error}")))?;
+                .await?;
 
                 if auth_result.success() {
                     info!("{stage} with key successful");
@@ -461,11 +618,31 @@ impl SshConnectionManager {
         )))
     }
 
+    async fn legacy_auth_request(
+        authentication: impl Future<Output = std::result::Result<client::AuthResult, russh::Error>>,
+        stage: &str,
+        per_request_timeout: bool,
+    ) -> Result<client::AuthResult> {
+        let result = if per_request_timeout {
+            timeout(Duration::from_secs(AUTH_TIMEOUT_SECS), authentication)
+                .await
+                .map_err(|_| {
+                    SshMcpError::auth(format!("{stage} timed out after {}s", AUTH_TIMEOUT_SECS))
+                })?
+        } else {
+            authentication.await
+        };
+        result.map_err(|error| SshMcpError::auth(format!("{stage} failed: {error}")))
+    }
+
     async fn disconnect_handle(session: Handle<SshHandler>) {
-        let _ = session
-            .disconnect(russh::Disconnect::ByApplication, "", "")
-            .await;
-        let _ = timeout(Duration::from_millis(500), session).await;
+        let _ = timeout(Duration::from_millis(500), async move {
+            let _ = session
+                .disconnect(russh::Disconnect::ByApplication, "", "")
+                .await;
+            let _ = session.await;
+        })
+        .await;
     }
 
     async fn disconnect_route(route: ActiveRoute) {
@@ -570,7 +747,7 @@ impl SshConnectionManager {
         let mut last_error: Option<SshMcpError> = None;
 
         while attempt <= max_attempts {
-            match self.connect().await {
+            match self.connect_classified().await {
                 Ok(()) => {
                     if attempt > 1 {
                         info!(
@@ -582,16 +759,19 @@ impl SshConnectionManager {
                     return Ok(());
                 }
                 Err(err) => {
+                    if !err.retryable {
+                        return Err(err.error);
+                    }
                     let backoff_ms = self.backoff_for_attempt(attempt);
                     warn!(
                         attempt = attempt,
                         max_attempts = max_attempts,
                         backoff_ms = backoff_ms,
                         reason = reason,
-                        error = ?err,
+                        error = ?err.error,
                         "SSH reconnect attempt failed"
                     );
-                    last_error = Some(err);
+                    last_error = Some(err.error);
 
                     if attempt < max_attempts && backoff_ms > 0 {
                         sleep(Duration::from_millis(backoff_ms)).await;
@@ -1125,27 +1305,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cancelled_connect_releases_owner_flag() {
+    async fn test_cancelled_connect_releases_owner_and_wakes_waiter() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind test listener");
         let port = listener.local_addr().expect("test listener address").port();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
         let accept_task = tokio::spawn(async move {
             let (_stream, _) = listener.accept().await.expect("accept test connection");
+            let _ = accepted_tx.send(());
             std::future::pending::<()>().await;
         });
         let config = SshConfig::new("127.0.0.1", "testuser")
             .with_port(port)
             .with_password("testpass");
-        let manager = SshConnectionManager::new(config).await;
+        let manager = Arc::new(SshConnectionManager::new(config).await);
+        let owner_manager = Arc::clone(&manager);
+        let owner = tokio::spawn(async move { owner_manager.connect().await });
+        timeout(Duration::from_secs(2), accepted_rx)
+            .await
+            .unwrap()
+            .unwrap();
 
-        let result = timeout(Duration::from_millis(100), manager.connect()).await;
-        assert!(result.is_err(), "silent peer should keep connect in flight");
+        let waiter = manager.connect_classified();
+        tokio::pin!(waiter);
+        tokio::select! {
+            result = &mut waiter => panic!("waiter completed before owner cancellation: {:?}", result.map_err(|error| error.error)),
+            _ = tokio::task::yield_now() => {}
+        }
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        let error = timeout(Duration::from_secs(2), &mut waiter)
+            .await
+            .expect("cancellation must wake concurrent waiter")
+            .unwrap_err();
+        assert!(
+            !error.retryable,
+            "waiters must not restart a cancelled attempt"
+        );
+        assert!(error.error.to_string().contains("cancelled"));
         assert!(
             !manager.is_connecting.load(Ordering::SeqCst),
             "cancelling connect must release the owner flag"
         );
-
+        assert!(!manager.is_connected().await);
         accept_task.abort();
     }
 }

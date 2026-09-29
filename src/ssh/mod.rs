@@ -3,6 +3,7 @@
 //! This module provides persistent SSH connection handling with automatic
 //! reconnection, authentication, and session management.
 
+mod agent;
 pub mod command;
 pub mod config;
 pub mod connection;
@@ -12,7 +13,7 @@ pub mod sanitize;
 
 // Re-exports
 pub use command::{CommandOutput, TransferRawOutput, wrap_command_with_timeout};
-pub use config::{HostKeyCheckMode, SshConfig, SshJumpConfig};
+pub use config::{AgentAuth, AuthMethod, EndpointAuth, HostKeyCheckMode, SshConfig, SshJumpConfig};
 pub use connection::SshConnectionManager;
 pub use elevation::{escape_for_shell, sanitize_password, wrap_sudo_command};
 pub use handler::{

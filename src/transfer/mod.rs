@@ -111,6 +111,8 @@ pub struct TransferSshOptions {
     pub port: u16,
     pub user: String,
     pub key_path: Option<PathBuf>,
+    /// Either endpoint authenticates through a local SSH agent.
+    pub agent_route: bool,
     pub host_key_checking: HostKeyCheckMode,
     pub known_hosts: Option<PathBuf>,
     pub jump: Option<TransferJumpOptions>,
@@ -346,6 +348,29 @@ impl TransferEngine {
         ctx: TransferExecutionContext,
         started_at: Instant,
     ) -> TransferResponse {
+        if ctx.ssh.agent_route
+            && !matches!(
+                params.transport,
+                TransferTransport::Auto | TransferTransport::ExecRaw
+            )
+        {
+            let transport = match params.transport {
+                TransferTransport::Sftp => "sftp",
+                TransferTransport::Scp => "scp",
+                TransferTransport::Rsync => "rsync",
+                TransferTransport::Auto | TransferTransport::ExecRaw => unreachable!(),
+            };
+            let mut response = TransferResponse::error(
+                params,
+                self.local_root(),
+                &format!(
+                    "transport '{transport}' is not supported when SSH-agent authentication is configured; use 'auto' or 'exec-raw'"
+                ),
+            );
+            response.elapsed_ms = Some(started_at.elapsed().as_millis() as u64);
+            return response;
+        }
+
         let key_path_opt = ctx.ssh.key_path.clone();
 
         if let Some(progress) = &ctx.progress {
@@ -398,6 +423,7 @@ impl TransferEngine {
         };
 
         let transports = match response.params.transport {
+            TransferTransport::Auto if ctx.ssh.agent_route => vec![TransferTransport::ExecRaw],
             TransferTransport::Auto => {
                 vec![
                     TransferTransport::Rsync,   // Try rsync first (most efficient)

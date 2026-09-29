@@ -53,8 +53,9 @@ pub use config::{Args, Config, JumpConfig};
 pub use error::{Result, SshMcpError};
 pub use server::SshMcpServer;
 pub use ssh::{
-    CommandOutput, HostKeyCheckMode, SshConfig, SshConnectionManager, SshHandler, SshJumpConfig,
-    escape_command_for_shell, escape_for_shell, escape_for_timeout_wrapper, sanitize_command,
-    sanitize_password, wrap_command_with_timeout, wrap_sudo_command,
+    AgentAuth, AuthMethod, CommandOutput, EndpointAuth, HostKeyCheckMode, SshConfig,
+    SshConnectionManager, SshHandler, SshJumpConfig, escape_command_for_shell, escape_for_shell,
+    escape_for_timeout_wrapper, sanitize_command, sanitize_password, wrap_command_with_timeout,
+    wrap_sudo_command,
 };
 pub use tools::{CheckProcessParams, ExecParams, SudoExecParams};

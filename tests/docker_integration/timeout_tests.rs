@@ -9,6 +9,8 @@ use std::time::Instant;
 
 fn docker_test_config(host: &str, port: u16) -> Config {
     Config {
+        agent: None,
+        auth_timeout_ms: None,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -115,6 +117,8 @@ async fn test_subsecond_timeout_500ms() {
     tracing::info!("Container ready at {}:{}", host, port);
 
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -206,6 +210,8 @@ async fn test_fractional_timeout_1500ms() {
     tracing::info!("Container ready at {}:{}", host, port);
 
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -286,6 +292,8 @@ async fn test_timeout_actually_fires_with_precision() {
     tracing::info!("Container ready at {}:{}", host, port);
 
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -376,6 +384,8 @@ async fn test_sudo_timeout_auto_detaches_to_background() {
     tracing::info!("Container ready at {}:{}", host, port);
 
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host: host.to_string(),
         port,
         user: "test".to_string(),

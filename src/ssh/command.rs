@@ -1590,17 +1590,28 @@ async fn raw_channel_task(
     let mut sent_closed = false;
     loop {
         tokio::select! {
+            biased;
             _ = cancellation.cancelled() => {
-                let _ = channel.eof().await;
-                let _ = channel.close().await;
-                let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                // EOF/Close only tear down SSH I/O: a remote writer may still finish
+                // and install its staging path. Signal the owned remote process group
+                // first, and let its shell run the EXIT cleanup before closing.
+                let stopped = tokio::time::timeout(Duration::from_secs(2), async {
+                    channel.signal(russh::Sig::TERM).await?;
                     while let Some(message) = channel.wait().await {
                         if matches!(message, ChannelMsg::Close) {
                             break;
                         }
                     }
+                    Ok::<(), russh::Error>(())
                 })
                 .await;
+                if !matches!(stopped, Ok(Ok(()))) {
+                    let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                        let _ = channel.signal(russh::Sig::KILL).await;
+                        let _ = channel.close().await;
+                    })
+                    .await;
+                }
                 if !sent_closed {
                     let _ = out_tx.send(RawStreamEvent::Closed).await;
                 }
@@ -1609,9 +1620,15 @@ async fn raw_channel_task(
             maybe_chunk = stdin_rx.recv(), if !stdin_closed => {
                 match maybe_chunk {
                     Some(chunk) => {
-                        channel.data(chunk.as_slice()).await.map_err(|e| {
-                            SshMcpError::connection(format!("Failed to send stdin: {e}"))
-                        })?;
+                        tokio::select! {
+                            biased;
+                            _ = cancellation.cancelled() => {}
+                            result = channel.data(chunk.as_slice()) => {
+                                result.map_err(|e| {
+                                    SshMcpError::connection(format!("Failed to send stdin: {e}"))
+                                })?;
+                            }
+                        }
                     }
                     None => {
                         stdin_closed = true;
@@ -1623,7 +1640,11 @@ async fn raw_channel_task(
                 match maybe_msg {
                     Some(msg) => {
                         let send_evt = |evt: RawStreamEvent| async {
-                            out_tx.send(evt).await.map_err(|_| ())
+                            tokio::select! {
+                                biased;
+                                _ = cancellation.cancelled() => Ok(()),
+                                result = out_tx.send(evt) => result.map_err(|_| ()),
+                            }
                         };
 
                         match msg {

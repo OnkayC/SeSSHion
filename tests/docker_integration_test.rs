@@ -52,6 +52,8 @@ async fn test_mcp_tools_with_docker() {
 
     // 2. Setup SshMcpServer configuration
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host: host.to_string(),
         port,
         user: "test".to_string(),
@@ -541,6 +543,8 @@ mod unix_transfer_tests {
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
         let config = Config {
+            agent: None,
+            auth_timeout_ms: None,
             host: host.to_string(),
             port,
             user: "test".to_string(),
@@ -695,6 +699,8 @@ async fn test_compact_response_has_paths() {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     let config = Config {
+        agent: None,
+        auth_timeout_ms: None,
         host: host.to_string(),
         port,
         user: "test".to_string(),
