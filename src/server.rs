@@ -190,6 +190,7 @@ impl SshMcpServer {
         if let Some(timeout) = config.auth_timeout_ms {
             ssh_config.auth.timeout = Some(Duration::from_millis(timeout));
         }
+        ssh_config.proxy_command = config.proxy_command.clone();
 
         if let Some(jump) = &config.jump {
             let jump_password = jump.password.clone().filter(|value| !value.is_empty());
@@ -932,6 +933,7 @@ mod tests {
             password: None,
             key: Some(spool.path().join("missing-private-key")),
             jump: None,
+            proxy_command: None,
             su_password: None,
             sudo_password: None,
             timeout_ms: 1_000,
@@ -990,6 +992,7 @@ mod tests {
                 password: None,
                 key: None,
                 jump: None,
+                proxy_command: None,
                 su_password: None,
                 sudo_password: None,
                 timeout_ms: 1_000,

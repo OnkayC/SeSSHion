@@ -41,6 +41,7 @@ async fn test_rsync_file_put_with_key_auth() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host.to_string(),
@@ -165,6 +166,7 @@ async fn test_rsync_file_get_with_key_auth() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host.to_string(),
@@ -291,6 +293,7 @@ async fn test_rsync_directory_put_with_key_auth() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host.to_string(),
@@ -425,6 +428,7 @@ async fn test_rsync_directory_get_with_key_auth() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host.to_string(),
@@ -575,6 +579,7 @@ async fn test_auto_transport_prefers_rsync() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host.to_string(),
@@ -703,6 +708,7 @@ async fn test_rsync_with_options() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host.to_string(),

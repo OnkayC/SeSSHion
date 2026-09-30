@@ -114,6 +114,9 @@ pub struct SshConfig {
     /// Optional SSH jump host with independent authentication material.
     pub jump: Option<SshJumpConfig>,
 
+    /// Explicit trusted local shell command providing the SSH byte stream.
+    pub proxy_command: Option<String>,
+
     /// Password for `su` elevation to root
     pub su_password: Option<String>,
 
@@ -166,6 +169,7 @@ impl SshConfig {
             username: username.into(),
             auth: EndpointAuth::legacy(None, None),
             jump: None,
+            proxy_command: None,
             su_password: None,
             sudo_password: None,
             keepalive_interval: 30,

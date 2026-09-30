@@ -48,6 +48,7 @@ async fn test_rsync_put_file_timeout() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host.to_string(),
@@ -215,6 +216,7 @@ async fn test_rsync_get_file_timeout() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host.to_string(),
@@ -364,6 +366,7 @@ async fn test_rsync_put_directory_timeout() {
     let (_key_dir, key_path) = setup_test_key();
 
     let config = Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host.to_string(),

@@ -176,6 +176,28 @@ fn openssh_proxy_command(
     Some(parts.join(" "))
 }
 
+/// OpenSSH prepends `exec` and expands percent tokens before invoking its shell.
+/// Run the trusted template in a POSIX shell and protect literal percents.
+fn explicit_openssh_proxy_command(
+    command: &str,
+    host: &str,
+    port: u16,
+    user: &str,
+) -> Result<String> {
+    let expanded = crate::ssh::proxy::expand_proxy_command(command, host, port, user)?;
+    let mut proxy = String::with_capacity(expanded.len() + 14);
+    proxy.push_str("/bin/sh -c '");
+    for ch in expanded.chars() {
+        match ch {
+            '%' => proxy.push_str("%%"),
+            '\'' => proxy.push_str("'\"'\"'"),
+            _ => proxy.push(ch),
+        }
+    }
+    proxy.push('\'');
+    Ok(proxy)
+}
+
 async fn check_local_ssh(
     transport: TransferTransport,
     timeout: Duration,
@@ -793,6 +815,7 @@ impl TransferEngine {
             host_key_checking: ctx.ssh.host_key_checking,
             known_hosts: ctx.ssh.known_hosts.clone(),
             jump: ctx.ssh.jump.clone(),
+            proxy_command: ctx.conn.config.proxy_command.clone(),
         };
 
         let overwrite = response.params.overwrite;
@@ -899,6 +922,7 @@ impl TransferEngine {
             host_key_checking: ctx.ssh.host_key_checking,
             known_hosts: ctx.ssh.known_hosts.clone(),
             jump: ctx.ssh.jump.clone(),
+            proxy_command: ctx.conn.config.proxy_command.clone(),
         };
 
         let overwrite = response.params.overwrite;

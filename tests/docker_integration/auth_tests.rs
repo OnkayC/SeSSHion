@@ -13,6 +13,7 @@ fn host_key_test_config(
     known_hosts: PathBuf,
 ) -> Config {
     Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host.to_string(),
@@ -70,6 +71,7 @@ async fn test_key_auth_with_password_fallback() {
 
     // Configure BOTH key and password - key should be preferred
     let config = Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host.to_string(),
@@ -243,6 +245,7 @@ async fn test_password_auth_with_key_fallback() {
 
     // Configure BOTH invalid key and valid password - password should be used
     let config = Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host.to_string(),
@@ -316,6 +319,7 @@ async fn test_both_key_and_password_configured() {
 
     // Configure BOTH valid key and valid password
     let config = Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host.to_string(),
@@ -453,6 +457,7 @@ async fn test_key_auth_failure_then_password_success() {
 
     // Configure with wrong key but correct password
     let config = Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host.to_string(),
@@ -529,6 +534,7 @@ async fn test_switch_auth_methods_between_transfers() {
 
     // First connection: Use key auth only
     let config_key_only = Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host_str.clone(),
@@ -604,6 +610,7 @@ async fn test_switch_auth_methods_between_transfers() {
 
     // Second connection: Use password auth only
     let config_password_only = Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host_str.clone(),
@@ -672,6 +679,7 @@ async fn test_switch_auth_methods_between_transfers() {
 
     // Third connection: Use both key and password (should prefer key)
     let config_both = Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host_str,

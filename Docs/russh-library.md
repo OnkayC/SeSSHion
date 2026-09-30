@@ -65,6 +65,37 @@ async fn connect_and_exec() -> Result<()> {
 }
 ```
 
+## Proxy commands in SeSSHion
+
+Use `--proxy-command` (or `SSH_MCP_PROXY_COMMAND`) to connect through a local
+program that carries SSH bytes on stdin and stdout. For Cloudflare Access:
+
+```sh
+ssh-mcp --host ssh-grok1.onkay.dev --user box --agent \
+  --proxy-command 'exec /opt/homebrew/bin/cloudflared access ssh --hostname %h'
+```
+
+The configured command runs under `/bin/sh -c` when SSH is first needed.
+SeSSHion expands `%h` to the destination hostname, `%p` to its SSH port, and
+`%r` to its username as shell-quoted words. Keep these placeholders outside
+existing shell quotes. Use `%%` for a literal percent, including percent signs
+in commands such as `printf`. Unsupported or incomplete tokens are rejected.
+
+The proxy only supplies the transport: normal host-key verification and
+password, key, or agent authentication still apply. The proxy process group
+is terminated on connection close, failed authentication, handshake timeout,
+or cancellation. Proxy stderr remains on the MCP server's stderr.
+
+Native command execution and exec-raw transfers share the proxied connection.
+Explicit SFTP, SCP, and rsync transfers receive the same proxy command through
+OpenSSH; templates are wrapped in a POSIX shell and literal percent signs are
+protected against a second OpenSSH expansion. Agent mode continues to use
+exec-raw for automatic transfers.
+
+Proxy commands require a POSIX shell and cannot be combined with `--jump`.
+SeSSHion does not automatically read `ProxyCommand` from `~/.ssh/config`; set
+the option explicitly in each MCP destination's launch arguments.
+
 ## Key Types
 
 ### Structs

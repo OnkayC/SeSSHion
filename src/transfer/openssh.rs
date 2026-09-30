@@ -29,6 +29,7 @@ pub struct OpenSshEndpoint {
     pub host_key_checking: HostKeyCheckMode,
     pub known_hosts: Option<PathBuf>,
     pub jump: Option<super::TransferJumpOptions>,
+    pub proxy_command: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,7 +104,7 @@ fn null_known_hosts_path() -> &'static str {
     "NUL"
 }
 
-fn common_ssh_options(endpoint: &OpenSshEndpoint) -> Vec<String> {
+fn common_ssh_options(endpoint: &OpenSshEndpoint) -> Result<Vec<String>> {
     let mut opts = vec![
         "-i".to_string(),
         endpoint.key_path.display().to_string(),
@@ -140,6 +141,17 @@ fn common_ssh_options(endpoint: &OpenSshEndpoint) -> Vec<String> {
     opts.push("-o".to_string());
     opts.push("LogLevel=ERROR".to_string());
 
+    if let Some(command) = &endpoint.proxy_command {
+        let proxy = super::explicit_openssh_proxy_command(
+            command,
+            &endpoint.host,
+            endpoint.port,
+            &endpoint.user,
+        )?;
+        opts.push("-o".to_string());
+        opts.push(format!("ProxyCommand={proxy}"));
+    }
+
     #[cfg(unix)]
     if let Some(jump) = &endpoint.jump
         && let Some(proxy) = super::openssh_proxy_command(
@@ -153,7 +165,7 @@ fn common_ssh_options(endpoint: &OpenSshEndpoint) -> Vec<String> {
         opts.push("-o".to_string());
         opts.push(format!("ProxyCommand={proxy}"));
     }
-    opts
+    Ok(opts)
 }
 
 async fn run_sftp_batch(
@@ -164,7 +176,7 @@ async fn run_sftp_batch(
 ) -> std::result::Result<ProcessOutput, super::TransportAttemptError> {
     let mut cmd = Command::new("sftp");
     cmd.arg("-P").arg(endpoint.port.to_string());
-    for opt in common_ssh_options(endpoint) {
+    for opt in common_ssh_options(endpoint).map_err(super::TransportAttemptError::Other)? {
         cmd.arg(opt);
     }
     cmd.arg("-b").arg("-");
@@ -208,7 +220,7 @@ async fn run_scp(
 ) -> std::result::Result<ProcessOutput, super::TransportAttemptError> {
     let mut cmd = Command::new("scp");
     cmd.arg("-P").arg(endpoint.port.to_string());
-    for opt in common_ssh_options(endpoint) {
+    for opt in common_ssh_options(endpoint).map_err(super::TransportAttemptError::Other)? {
         cmd.arg(opt);
     }
     for a in args {
@@ -658,6 +670,7 @@ mod tests {
             host_key_checking: HostKeyCheckMode::No,
             known_hosts: None,
             jump: None,
+            proxy_command: None,
         };
         let spec = scp_remote_spec(&endpoint, "/path/with space/it's.txt");
         assert_eq!(spec, "alice@example.com:'/path/with space/it'\"'\"'s.txt'");
@@ -673,8 +686,9 @@ mod tests {
             host_key_checking: HostKeyCheckMode::No,
             known_hosts: None,
             jump: None,
+            proxy_command: None,
         };
-        let opts = common_ssh_options(&endpoint);
+        let opts = common_ssh_options(&endpoint).unwrap();
         assert!(opts.contains(&"StrictHostKeyChecking=no".to_string()));
         assert!(opts.iter().any(|o| o.starts_with("UserKnownHostsFile=")));
     }
@@ -689,8 +703,9 @@ mod tests {
             host_key_checking: HostKeyCheckMode::AcceptNew,
             known_hosts: Some(PathBuf::from("/tmp/known_hosts")),
             jump: None,
+            proxy_command: None,
         };
-        let opts = common_ssh_options(&endpoint);
+        let opts = common_ssh_options(&endpoint).unwrap();
         assert!(opts.contains(&"StrictHostKeyChecking=accept-new".to_string()));
         assert!(opts.contains(&"UserKnownHostsFile=/tmp/known_hosts".to_string()));
     }
@@ -711,9 +726,11 @@ mod tests {
                 user: "jump-user".to_string(),
                 key_path: Some(PathBuf::from("/keys/jump key")),
             }),
+            proxy_command: None,
         };
 
         let proxy = common_ssh_options(&endpoint)
+            .unwrap()
             .into_iter()
             .find(|option| option.starts_with("ProxyCommand="))
             .expect("proxy command");

@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 
 use super::config::{AuthMethod, EndpointAuth, SshConfig};
 use super::handler::{KeyCheckOutcome, SshHandler};
+use super::proxy::{ProxyProcess, ProxyStream, expand_proxy_command};
 use crate::config::CONNECTION_TIMEOUT_SECS;
 use crate::error::{Result, SshMcpError};
 use russh::ChannelMsg;
@@ -102,6 +103,7 @@ struct ConnectAttemptGuard<'a> {
 struct ActiveRoute {
     target: Handle<SshHandler>,
     jump: Option<Handle<SshHandler>>,
+    proxy: Option<ProxyProcess>,
 }
 
 impl Drop for ConnectAttemptGuard<'_> {
@@ -282,7 +284,12 @@ impl SshConnectionManager {
             ..Default::default()
         });
 
-        let (target, jump) = if let Some(jump_config) = &self.config.jump {
+        if self.config.proxy_command.is_some() && self.config.jump.is_some() {
+            return Err(ConnectError::terminal(SshMcpError::config(
+                "proxy command and SSH jump host cannot be combined",
+            )));
+        }
+        let (target, jump, proxy) = if let Some(jump_config) = &self.config.jump {
             info!(
                 "Connecting through jump host {}@{}:{}",
                 jump_config.username, jump_config.host, jump_config.port
@@ -366,7 +373,39 @@ impl SshConnectionManager {
                     .into());
                 }
             };
-            (target, Some(jump))
+            (target, Some(jump), None)
+        } else if let Some(command) = &self.config.proxy_command {
+            let command = expand_proxy_command(
+                command,
+                &self.config.host,
+                self.config.port,
+                &self.config.username,
+            )?;
+            let (stream, process) = ProxyStream::spawn(&command)?;
+            let key_outcome = Arc::new(StdMutex::new(None));
+            let handler = self
+                .target_handler()
+                .with_key_check_outcome(Arc::clone(&key_outcome));
+            let target = timeout(
+                connection_timeout,
+                client::connect_stream(ssh_config.clone(), stream, handler),
+            )
+            .await
+            .map_err(|_| {
+                SshMcpError::connection(format!(
+                    "target connection through proxy timed out after {}s",
+                    CONNECTION_TIMEOUT_SECS
+                ))
+            })?
+            .map_err(|error| {
+                Self::transport_error(
+                    SshMcpError::connection(format!(
+                        "target connection through proxy failed: {error}"
+                    )),
+                    &key_outcome,
+                )
+            })?;
+            (target, None, Some(process))
         } else {
             let target = self
                 .connect_tcp_endpoint(
@@ -377,10 +416,10 @@ impl SshConnectionManager {
                     connection_timeout,
                 )
                 .await?;
-            (target, None)
+            (target, None, None)
         };
 
-        self.finish_connect(target, jump).await
+        self.finish_connect(target, jump, proxy).await
     }
 
     fn target_handler(&self) -> SshHandler {
@@ -448,6 +487,7 @@ impl SshConnectionManager {
         &self,
         mut target: Handle<SshHandler>,
         jump: Option<Handle<SshHandler>>,
+        proxy: Option<ProxyProcess>,
     ) -> ClassifiedResult<()> {
         if let Err(error) = Self::authenticate_session(
             &mut target,
@@ -466,7 +506,11 @@ impl SshConnectionManager {
         }
 
         // Do not publish a connection that completed after shutdown began.
-        let mut route = Some(ActiveRoute { target, jump });
+        let mut route = Some(ActiveRoute {
+            target,
+            jump,
+            proxy,
+        });
         {
             let mut session_guard = self.session.lock().await;
             if !self.is_shutting_down() {
@@ -650,6 +694,7 @@ impl SshConnectionManager {
         if let Some(jump) = route.jump {
             Self::disconnect_handle(jump).await;
         }
+        drop(route.proxy);
     }
 
     /// Check if the connection is active

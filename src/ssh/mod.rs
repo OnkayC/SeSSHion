@@ -9,6 +9,7 @@ pub mod config;
 pub mod connection;
 pub mod elevation;
 pub mod handler;
+pub(crate) mod proxy;
 pub mod sanitize;
 
 // Re-exports

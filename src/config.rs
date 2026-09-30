@@ -85,6 +85,10 @@ pub struct Args {
     #[arg(long, env = "SSH_MCP_JUMP")]
     pub jump: Option<String>,
 
+    /// Trusted local shell command providing the SSH byte stream (%h, %p, %r, %%).
+    #[arg(long, env = "SSH_MCP_PROXY_COMMAND", conflicts_with = "jump")]
+    pub proxy_command: Option<String>,
+
     /// Path to the jump host SSH private key file
     #[arg(long, env = "SSH_MCP_JUMP_KEY")]
     pub jump_key: Option<PathBuf>,
@@ -211,6 +215,9 @@ pub struct Config {
     /// Optional SSH jump host and its independent credentials
     pub jump: Option<JumpConfig>,
 
+    /// Explicit local shell command providing the SSH transport.
+    pub proxy_command: Option<String>,
+
     /// Password for su elevation
     pub su_password: Option<String>,
 
@@ -334,6 +341,7 @@ impl Config {
             agent,
             auth_timeout_ms: args.auth_timeout_ms,
             jump,
+            proxy_command: args.proxy_command,
             su_password: args.su_password,
             sudo_password: args.sudo_password,
             timeout_ms: args.timeout,
@@ -487,6 +495,21 @@ fn validate_args(args: &Args) -> Result<()> {
 
     if args.user.is_empty() {
         errors.push("Missing required --user".to_string());
+    }
+
+    if let Some(command) = &args.proxy_command {
+        if args.jump.is_some() {
+            errors.push("--proxy-command conflicts with --jump".into());
+        }
+        if command.trim().is_empty() {
+            errors.push("--proxy-command must not be empty".into());
+        } else if command.contains('\0') {
+            errors.push("--proxy-command must not contain NUL bytes".into());
+        } else if let Err(error) =
+            crate::ssh::proxy::expand_proxy_command(command, &args.host, args.port, &args.user)
+        {
+            errors.push(format!("Invalid --proxy-command: {error}"));
+        }
     }
 
     if !args.agent && args.password.is_none() && args.key.is_none() {
@@ -661,6 +684,7 @@ mod tests {
             jump_agent_socket: None,
             jump_agent_identity: None,
             jump: None,
+            proxy_command: None,
             jump_key: None,
             jump_password: None,
             spool_dir: None,
@@ -682,6 +706,38 @@ mod tests {
             strict_host_key_checking: HostKeyCheckMode::AcceptNew,
             known_hosts: None,
         }
+    }
+
+    #[test]
+    fn proxy_command_rejects_invalid_shell_templates() {
+        for command in [
+            "",
+            " \t\n",
+            "cloudflared\0 access ssh",
+            "connect %",
+            "connect %x",
+        ] {
+            let mut args = base_args();
+            args.proxy_command = Some(command.into());
+            let error = Config::from_args_with_home(args, None).unwrap_err();
+            assert!(
+                matches!(&error, SshMcpError::Config(message) if message.contains("--proxy-command")),
+                "unexpected rejection for {command:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_command_rejects_jump_route() {
+        let mut args = base_args();
+        args.proxy_command = Some("cloudflared access ssh --hostname %h".into());
+        args.jump = Some("jump@example.test".into());
+        args.jump_password = Some("secret".into());
+        let error = Config::from_args_with_home(args, None).unwrap_err();
+        assert!(
+            matches!(&error, SshMcpError::Config(message) if message.contains("--proxy-command conflicts with --jump")),
+            "unexpected rejection: {error}"
+        );
     }
 
     #[test]

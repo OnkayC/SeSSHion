@@ -48,6 +48,7 @@ fn assert_local_log_file_present(log_path: &str) {
 
 fn docker_test_config(host: &str, port: u16) -> Config {
     Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host.to_string(),

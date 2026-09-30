@@ -5,6 +5,7 @@ use std::time::Instant;
 
 fn docker_test_config(host: &str, port: u16) -> Config {
     Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: host.to_string(),

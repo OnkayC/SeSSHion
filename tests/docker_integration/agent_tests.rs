@@ -43,6 +43,7 @@ async fn authorize(
 }
 fn config(host: &str, port: u16, socket: &Path, key: Option<&PrivateKey>) -> Config {
     Config {
+        proxy_command: None,
         host: host.into(),
         port,
         user: "test".into(),

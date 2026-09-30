@@ -39,6 +39,7 @@ async fn start_container() -> (testcontainers::ContainerAsync<GenericImage>, Str
 
 fn target_config(key_path: PathBuf, jump: JumpConfig) -> Config {
     Config {
+        proxy_command: None,
         agent: None,
         auth_timeout_ms: None,
         host: "127.0.0.1".to_string(),
@@ -183,4 +184,108 @@ async fn password_jump_uses_exec_raw_and_rejects_explicit_sftp() {
 
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(local_dir);
+}
+
+#[tokio::test]
+async fn explicit_proxy_routes_native_and_legacy_transfers_preserving_literal_percent() {
+    if !check_openssh_client("ssh") || !check_sftp() || !check_scp() || !check_rsync() {
+        tracing::warn!("skipping: local OpenSSH or rsync unavailable");
+        return;
+    }
+    let (_container, jump_host, jump_port) = start_container().await;
+    let (_target_key_dir, target_key) = setup_test_key();
+    let (_jump_key_dir, jump_key) = setup_jump_test_key();
+    let local_dir = tempfile::Builder::new()
+        .prefix("proxy route's ")
+        .tempdir()
+        .expect("create proxy test directory");
+    let recorder = local_dir.path().join("route.log");
+    let quote = |value: &str| format!("'{}'", ssh_mcp::escape_for_shell(value));
+    let mut config = target_config(
+        target_key,
+        JumpConfig {
+            agent: None,
+            host: jump_host.clone(),
+            port: jump_port,
+            user: "jump".to_string(),
+            password: None,
+            key: Some(jump_key.clone()),
+        },
+    );
+    config.jump = None;
+    // The target is reachable only through the container's forwarding SSH login.
+    // Recording a literal %h detects a second, unintended token expansion by OpenSSH.
+    config.proxy_command = Some(format!(
+        r#"printf '%%s\n' %h %p %r '%%h' >> {}; exec ssh -i {} -p {} -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -W %h:%p {}"#,
+        quote(&recorder.to_string_lossy()),
+        quote(&jump_key.to_string_lossy()),
+        jump_port,
+        quote(&format!("jump@{jump_host}")),
+    ));
+    let server = SshMcpServer::new(config)
+        .await
+        .expect("create SSH server through explicit proxy");
+    let whoami = server
+        .test_execute_command("whoami")
+        .await
+        .expect("execute native command through proxy");
+    assert_eq!(extract_text_from_result(&whoami).trim(), "test");
+    assert_eq!(
+        std::fs::read_to_string(&recorder).expect("native proxy invocation"),
+        "127.0.0.1\n2222\ntest\n%h\n"
+    );
+
+    let payload = b"proxy transfer payload\n";
+    let source = local_dir.path().join("source.txt");
+    std::fs::write(&source, payload).expect("write transfer source");
+    for (index, transport) in [
+        TransferTransport::ExecRaw,
+        TransferTransport::Sftp,
+        TransferTransport::Scp,
+        TransferTransport::Rsync,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let remote_path = format!("/home/test/explicit-proxy-{index}.txt");
+        let destination = local_dir.path().join(format!("download-{index}.txt"));
+        for (operation, local_path) in [
+            (TransferOperation::Put, &source),
+            (TransferOperation::Get, &destination),
+        ] {
+            std::fs::write(&recorder, "").expect("clear proxy invocation recorder");
+            let response = server
+                .test_transfer(TransferParams {
+                    operation,
+                    local_path: local_path.to_string_lossy().into_owned(),
+                    remote_path: remote_path.clone(),
+                    transport,
+                    kind: Some(TransferKind::File),
+                    overwrite: true,
+                    timeout_ms: Some(30_000),
+                    ..Default::default()
+                })
+                .await;
+            assert!(
+                response.ok,
+                "{transport:?} {operation:?} through proxy failed: {:?}",
+                response.error
+            );
+            assert_eq!(response.transport_used, transport);
+            if transport != TransferTransport::ExecRaw {
+                let recorded = std::fs::read_to_string(&recorder).expect("legacy proxy invocation");
+                assert_eq!(
+                    recorded.lines().take(4).collect::<Vec<_>>(),
+                    ["127.0.0.1", "2222", "test", "%h"],
+                    "proxy substitutions for {transport:?} {operation:?}"
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read(&destination).expect("read transferred payload"),
+            payload,
+            "round-trip payload through {transport:?}"
+        );
+    }
+    server.shutdown().await;
 }

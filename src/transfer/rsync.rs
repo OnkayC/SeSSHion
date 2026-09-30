@@ -25,6 +25,7 @@ pub struct RsyncEndpoint {
     pub host_key_checking: HostKeyCheckMode,
     pub known_hosts: Option<PathBuf>,
     pub jump: Option<super::TransferJumpOptions>,
+    pub proxy_command: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -124,7 +125,7 @@ fn null_known_hosts_path() -> &'static str {
     "NUL"
 }
 
-fn build_ssh_options(endpoint: &RsyncEndpoint) -> String {
+fn build_ssh_options(endpoint: &RsyncEndpoint) -> Result<String> {
     let mut opts = vec![
         "-o".to_string(),
         "BatchMode=yes".to_string(),
@@ -170,6 +171,20 @@ fn build_ssh_options(endpoint: &RsyncEndpoint) -> String {
         opts.push(format!("'{}'", escaped));
     }
 
+    if let Some(command) = &endpoint.proxy_command {
+        let proxy = super::explicit_openssh_proxy_command(
+            command,
+            &endpoint.host,
+            endpoint.port,
+            &endpoint.user,
+        )?;
+        opts.push("-o".to_string());
+        opts.push(format!(
+            "'{}'",
+            escape_for_shell(&format!("ProxyCommand={proxy}"))
+        ));
+    }
+
     #[cfg(unix)]
     if let Some(jump) = &endpoint.jump
         && let Some(proxy) = super::openssh_proxy_command(
@@ -187,7 +202,7 @@ fn build_ssh_options(endpoint: &RsyncEndpoint) -> String {
         ));
     }
 
-    opts.join(" ")
+    Ok(opts.join(" "))
 }
 
 fn rsync_remote_spec(endpoint: &RsyncEndpoint, remote_path: &str) -> String {
@@ -202,7 +217,7 @@ async fn run_rsync(
     timeout_duration: Duration,
     cancellation: &CancellationToken,
 ) -> std::result::Result<TransferCounts, super::TransportAttemptError> {
-    let ssh_opts = build_ssh_options(endpoint);
+    let ssh_opts = build_ssh_options(endpoint).map_err(super::TransportAttemptError::Other)?;
     let mut cmd = Command::new("rsync");
 
     cmd.arg("--archive")
@@ -570,6 +585,7 @@ Total bytes received: 172"#;
             host_key_checking: HostKeyCheckMode::No,
             known_hosts: None,
             jump: None,
+            proxy_command: None,
         };
         let spec = rsync_remote_spec(&endpoint, "/path/to/file.txt");
         assert_eq!(spec, "alice@example.com:/path/to/file.txt");
@@ -591,8 +607,9 @@ Total bytes received: 172"#;
             host_key_checking: HostKeyCheckMode::No,
             known_hosts: None,
             jump: None,
+            proxy_command: None,
         };
-        let opts = build_ssh_options(&endpoint);
+        let opts = build_ssh_options(&endpoint).unwrap();
         assert!(opts.contains("-p 2222"));
 
         let key_str = key_path.display().to_string();
@@ -613,8 +630,9 @@ Total bytes received: 172"#;
             host_key_checking: HostKeyCheckMode::AcceptNew,
             known_hosts: Some(PathBuf::from("/tmp/my known_hosts")),
             jump: None,
+            proxy_command: None,
         };
-        let opts = build_ssh_options(&endpoint);
+        let opts = build_ssh_options(&endpoint).unwrap();
         assert!(opts.contains("StrictHostKeyChecking=accept-new"));
         assert!(opts.contains("UserKnownHostsFile='/tmp/my known_hosts'"));
     }
@@ -635,9 +653,10 @@ Total bytes received: 172"#;
                 user: "jump-user".to_string(),
                 key_path: Some(PathBuf::from("/keys/jump key")),
             }),
+            proxy_command: None,
         };
 
-        let options = build_ssh_options(&endpoint);
+        let options = build_ssh_options(&endpoint).unwrap();
         assert!(options.contains("ProxyCommand=ssh"));
         assert!(options.contains("/keys/jump key"));
         assert!(options.contains("127.0.0.1:2222"));
