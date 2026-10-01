@@ -19,9 +19,15 @@ pub(crate) async fn read_background_markers_from_channel(
     let mut line_start = 0usize;
 
     let fut = async {
+        let mut exit_status = None;
         while parsed_lines < 3 {
             let Some(msg) = channel.wait().await else {
-                return Err("channel ended before background markers".to_string());
+                return Err(match exit_status {
+                    Some(exit_status) => format!(
+                        "channel exited before background markers (exit_status={exit_status})"
+                    ),
+                    None => "channel ended before background markers".to_string(),
+                });
             };
 
             match msg {
@@ -53,10 +59,11 @@ pub(crate) async fn read_background_markers_from_channel(
                         "unexpected stderr while reading background markers: {snippet}"
                     ));
                 }
-                russh::ChannelMsg::ExitStatus { exit_status } => {
-                    return Err(format!(
-                        "channel exited before background markers (exit_status={exit_status})"
-                    ));
+                russh::ChannelMsg::ExitStatus {
+                    exit_status: status,
+                } => {
+                    // Exit status is not end-of-stream; marker data may follow.
+                    exit_status = Some(status);
                 }
                 russh::ChannelMsg::Close | russh::ChannelMsg::Eof => {
                     // Keep reading: ExitStatus may still arrive.

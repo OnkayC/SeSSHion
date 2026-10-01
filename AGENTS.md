@@ -8,9 +8,7 @@ SeSSHion is a lightweight Rust SSH Model Context Protocol (MCP) server for LLM a
 .
  ├── Cargo.toml            # Project manifest and dependencies
  ├── README.md             # Detailed project overview and usage
- ├── AGENTS.md             # LLM-oriented project documentation (this file)
  ├── CODE_OF_CONDUCT.md    # Community guidelines
- ├── CONTRIBUTING.md       # Contribution guidelines
  ├── docker-compose.yml    # Docker Compose configuration for E2E tests
 ├── .github/              # CI/CD and GitHub configuration
 │   └── workflows/        # GitHub Actions definitions
@@ -34,6 +32,7 @@ SeSSHion is a lightweight Rust SSH Model Context Protocol (MCP) server for LLM a
 │   │   ├── agent_tests.rs         # Agent, jump, transfer, and multi-process acceptance tests
 │   │   ├── check_process_tests.rs # Process monitoring tests
 │   │   ├── exec_raw_tests.rs     # ExecRaw transport tests
+│   │   ├── host_environment_tests.rs # Rootless startup, bounded failures and frozen instructions
 │   │   ├── sftp_tests.rs         # SFTP transport tests
 │   │   ├── scp_tests.rs          # SCP transport tests
 │   │   ├── rsync_tests.rs        # Rsync transfer tests
@@ -79,11 +78,12 @@ SeSSHion is a lightweight Rust SSH Model Context Protocol (MCP) server for LLM a
 │   ├── validate.rs             # Shared path/string validation utilities with unit tests
 │   ├── ssh/                    # SSH core logic
 │   │   ├── mod.rs              # SSH module definition
-│   │   ├── connection.rs       # SSH session, connection management, and slot semaphore helpers
+│   │   ├── connection.rs       # SSH route generations, deferred auto-su and slot semaphore
 │   │   ├── agent.rs             # Native agent signer, identity selection, and endpoint deadline
 │   │   ├── command.rs          # Command execution over SSH
 │   │   ├── handler.rs          # SSH event handlers (russh implementation)
 │   │   ├── elevation.rs        # Privileged execution (su/sudo) logic
+│   │   ├── environment.rs      # 3-second startup probe including connect; no elevation; instructions freeze before serving
 │   │   ├── sanitize.rs         # Input validation and command safety
 │   │   └── config.rs           # SSH-specific configuration structures
  │   ├── background/             # Background job subsystem (extracted from server.rs)
@@ -110,6 +110,14 @@ SeSSHion is a lightweight Rust SSH Model Context Protocol (MCP) server for LLM a
 │       ├── types.rs            # Transfer type definitions
 │       └── local_root.rs       # Local filesystem root operations
 ```
+
+## Builds and Verification
+
+Use `mbx` instead of `cargo` for builds, tests, formatting, and Clippy.
+Docker transfer fixtures live under `target/tmp` and exercise no-symlink path
+validation. If `target` is an mbx-managed symlink, run `mbx clean`, then
+`MBX_TARGET_VIEWS=0 mbx test --locked --all` to use a real target directory.
+After the tests, `mbx build --release --locked` restores normal target management.
 
 ## Commit Style
 

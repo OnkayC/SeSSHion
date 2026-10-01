@@ -75,7 +75,11 @@ ssh-mcp --host ssh-grok1.onkay.dev --user box --agent \
   --proxy-command 'exec /opt/homebrew/bin/cloudflared access ssh --hostname %h'
 ```
 
-The configured command runs under `/bin/sh -c` when SSH is first needed.
+The configured command runs under `/bin/sh -c` when SSH is first needed,
+including the CLI's startup environment probe. That probe shares a 3-second
+total deadline across proxy startup, SSH authentication, and metadata collection.
+A successful route is reused by tools; otherwise MCP starts with unknown
+metadata and later tools can connect using their normal authentication budgets.
 SeSSHion expands `%h` to the destination hostname, `%p` to its SSH port, and
 `%r` to its username as shell-quoted words. Keep these placeholders outside
 existing shell quotes. Use `%%` for a literal percent, including percent signs

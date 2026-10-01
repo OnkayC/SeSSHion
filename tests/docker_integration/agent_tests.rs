@@ -3,6 +3,7 @@
 use super::common::*;
 #[path = "../support/spy_agent.rs"]
 mod spy_agent;
+use rmcp::ServerHandler;
 use russh::keys::PrivateKey;
 use spy_agent::{Behavior, SpyAgent, generate_key};
 use ssh_mcp::AgentAuth;
@@ -100,7 +101,15 @@ async fn agent_only_shell_patch_jobs_and_connection_reuse() {
     let agent = SpyAgent::new(std::slice::from_ref(&key)).await;
     let server = SshMcpServer::new(config(&host, port, agent.socket(), None))
         .await
-        .unwrap();
+        .unwrap()
+        .with_startup_environment(tokio_util::sync::CancellationToken::new())
+        .await;
+    let instructions = server.get_info().instructions.unwrap();
+    let environment: serde_json::Value =
+        serde_json::from_str(instructions.lines().last().unwrap()).unwrap();
+    assert_eq!(environment["effective_uid"], 1000);
+    assert_eq!(environment["running_as_root"], false);
+    assert_eq!(agent.sign_count(), 1, "startup authenticates once");
     assert_eq!(command(&server, "whoami").await.trim(), "test");
     let patch = "*** Begin Patch\n*** Add File: /home/test/agent-patch.txt\n+agent patch content\n*** End Patch";
     let result = server.test_apply_patch(patch).await.unwrap();

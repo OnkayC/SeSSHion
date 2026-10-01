@@ -197,7 +197,7 @@ async fn explicit_proxy_routes_native_and_legacy_transfers_preserving_literal_pe
     let (_jump_key_dir, jump_key) = setup_jump_test_key();
     let local_dir = tempfile::Builder::new()
         .prefix("proxy route's ")
-        .tempdir()
+        .tempdir_in(std::env::current_dir().expect("workspace local root"))
         .expect("create proxy test directory");
     let recorder = local_dir.path().join("route.log");
     let quote = |value: &str| format!("'{}'", ssh_mcp::escape_for_shell(value));
@@ -224,7 +224,14 @@ async fn explicit_proxy_routes_native_and_legacy_transfers_preserving_literal_pe
     ));
     let server = SshMcpServer::new(config)
         .await
-        .expect("create SSH server through explicit proxy");
+        .expect("create SSH server through explicit proxy")
+        .with_startup_environment(tokio_util::sync::CancellationToken::new())
+        .await;
+    let instructions = rmcp::ServerHandler::get_info(&server).instructions.unwrap();
+    let environment: serde_json::Value =
+        serde_json::from_str(instructions.lines().last().unwrap()).unwrap();
+    assert_eq!(environment["effective_uid"], 1000);
+    assert_eq!(environment["running_as_root"], false);
     let whoami = server
         .test_execute_command("whoami")
         .await
@@ -253,7 +260,6 @@ async fn explicit_proxy_routes_native_and_legacy_transfers_preserving_literal_pe
             (TransferOperation::Put, &source),
             (TransferOperation::Get, &destination),
         ] {
-            std::fs::write(&recorder, "").expect("clear proxy invocation recorder");
             let response = server
                 .test_transfer(TransferParams {
                     operation,
@@ -272,20 +278,19 @@ async fn explicit_proxy_routes_native_and_legacy_transfers_preserving_literal_pe
                 response.error
             );
             assert_eq!(response.transport_used, transport);
-            if transport != TransferTransport::ExecRaw {
-                let recorded = std::fs::read_to_string(&recorder).expect("legacy proxy invocation");
-                assert_eq!(
-                    recorded.lines().take(4).collect::<Vec<_>>(),
-                    ["127.0.0.1", "2222", "test", "%h"],
-                    "proxy substitutions for {transport:?} {operation:?}"
-                );
-            }
         }
         assert_eq!(
             std::fs::read(&destination).expect("read transferred payload"),
             payload,
             "round-trip payload through {transport:?}"
         );
+    }
+    // OpenSSH may reuse a ControlMaster rather than launch a proxy for every
+    // transfer. Validate every actual launch without requiring fresh processes.
+    let recorded = std::fs::read_to_string(&recorder).expect("proxy invocation record");
+    let lines = recorded.lines().collect::<Vec<_>>();
+    for launch in lines.chunks(4) {
+        assert_eq!(launch, ["127.0.0.1", "2222", "test", "%h"]);
     }
     server.shutdown().await;
 }

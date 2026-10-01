@@ -11,7 +11,7 @@ Its capability-bound toolset combines deterministic long-running jobs, bounded c
 
 ## Why
 
-- **Capability-bound surface.** Four base tools and two optional sudo variants, no open-ended remote API. The agent can only run commands, patch files, transfer files, and inspect background jobs.
+- **Capability-bound surface.** Four base tools and two optional sudo variants, no open-ended remote API. The agent can run commands, patch files, transfer files, and inspect background jobs. Rootless host context arrives automatically in init instructions.
 - **Deterministic long-running jobs.** `background=true` returns a `job_id` immediately for commands and transfers; poll it with `check_process` instead of depending on the client RPC deadline.
 - **Bounded context.** Foreground shell output is capped by `--max-output-tokens` by default. Use bounded commands when inspecting large remote files.
 - **Per-file atomic remote edits.** `apply_patch` edits as the SSH user; the separately gated `sudo_apply_patch` preserves the same conflict detection and atomic commit under sudo. Multi-file calls are not transactions.
@@ -30,6 +30,87 @@ Its capability-bound toolset combines deterministic long-running jobs, bounded c
 Full parameter schemas are served to the client at runtime; deeper references live in [`Docs/`](#documentation).
 
 Inspect remote text with bounded shell commands such as `head -n 800 -- /path`, `tail -n 200 -- /path`, or `sed -n '801,1600p' -- /path`. Use `transfer` with `operation=get` to retrieve files instead of printing large content into the MCP response.
+
+### Rootless startup environment
+
+Before serving MCP, the CLI automatically collects one best-effort remote snapshot
+and embeds its compact JSON in `instructions`, delivered by both `initialize` and
+`server/discover`. There is no environment tool to call. MCP clients decide how
+server instructions are included in the model's context. The 14 fixed fields are:
+
+`hostname`, `os`, `distribution`, `kernel_release`, `machine_architecture`,
+`process_architecture`, `pointer_width`, `available_cpu_parallelism`,
+`effective_uid`, `effective_gid`, `running_as_root`, `shell_executable`,
+`cpu_models`, and `virtualization`.
+
+`cpu_models` is `null` or a sorted sample of at most four unique kernel-reported
+model names (trimmed UTF-8, no control characters, at most 256 bytes per name).
+The probe reads `/proc/cpuinfo` once using POSIX builtins, considering only the
+first 128 lines within a 64 KiB **post-read processing budget**, and emits small
+summaries rather than the raw file. A crossing line is discarded. POSIX `read`
+consumes a whole line before its size can be checked; this is not a hard remote
+allocation/input-byte limit. Only `model name` is used: ARM systems reporting
+only CPU implementer/part or board `Hardware` can legitimately return `null`.
+This is neither a complete CPU inventory nor verified physical-host identification.
+
+`virtualization` always contains independent `container` and `vm` values:
+
+```json
+"virtualization":{"container":"docker","vm":null}
+```
+
+Known identifiers mean positive supported evidence; `"unknown"` means positive
+but unidentified/conflicting evidence; `null` means not determined, **never**
+confirmed absence or bare metal. A named `/run/systemd/container` declaration
+takes precedence over markers; generic `oci` can be refined by markers, with
+`/run/.containerenv` (Podman) before `/.dockerenv` (Docker). VM evidence uses
+`/sys/hypervisor/type`, narrow DMI product/vendor signatures for KVM/QEMU, VMware,
+VirtualBox, Xen and the Microsoft/Virtual Machine pair for Hyper-V, then the exact
+`hypervisor` CPU flag. `vmx`/`svm` are only capabilities. KVM refines QEMU; QEMU alone
+does not rule out KVM acceleration. Xen includes control domains: `vm` does not
+assert guest role or enumerate nesting. Container and VM may both be populated.
+These hints are not a security guarantee; cloud/physical-looking DMI and missing
+flags/markers cannot prove absence. No GPU or codec detection is performed.
+
+Collection never initiates `su` or `sudo`, even when establishing
+the shared SSH connection with elevation configured. A root SSH login can
+legitimately report UID 0. Values describe the ordinary probe's visible
+namespaces/rootfs, not necessarily the physical host or an elevated command.
+Process architecture, pointer width and executable describe its non-login POSIX
+`sh`, not the SSH account's login shell. CPU parallelism is a positive `nproc`
+estimate, **not** a guarantee that every cgroup quota is accounted for.
+
+Missing utilities, unreadable files, unsupported ELF ABIs and malformed values
+become unknown; unknown UID also means `running_as_root:null`. Sources include
+`uname` with selected `/proc` fallbacks, `id` with effective IDs from proc status,
+and `os-release` parsed as data, never sourced/evaluated. `/usr/lib/os-release`
+is used only when `/etc/os-release` is absent; their contents are never merged.
+
+After server construction, one **3-second total bootstrap budget** covers SSH
+connect/auth/retries, probe waits, execution and best-effort channel cleanup.
+Signals cancel bootstrap before MCP serving. Ordinary tool connections retain their
+existing timeout/retry policies. Raw stdout is capped at 64 KiB, stderr at 4 KiB; text scalars at 1 KiB,
+release/status files at 16 KiB, executable paths at 4 KiB, and ELF at 64 bytes.
+New CPU/virtualization sources use builtins without extra diagnostic utilities;
+their records precede ELF so a missing `dd` does not hide the new information.
+Completed fields survive later timeout/overflow. Metadata failures close only
+the probe channel; closing it is not a guarantee of killing all descendants.
+SSH/authentication failure or establishment timeout produces an unknown snapshot
+instead of failing MCP startup. Normal tools can retry connecting afterwards.
+
+The final instructions are frozen for the lifetime of the server process, including
+partial/unknown values. Commands and SSH reconnect do not recollect or rewrite them.
+A new process startup obtains a new snapshot. There is no refresh API, session
+snapshot cache, TTL, polling or background collection. Library construction stays
+lazy; programmatic consumers can use `with_startup_environment` before serving.
+
+**Prompt/KV-cache friendly:** each run's prepared instructions, tool schemas and
+order remain byte-stable through commands and SSH reconnect. Snapshot values are
+labeled data and include no timestamps, elapsed time or cache-hit/session metadata.
+The tradeoff is that this startup snapshot may become stale, or stay unknown after
+an initial connection failure. A new process can produce different instructions;
+provider cache hits and client serialization/history compaction remain outside the
+server's control.
 
 ### Multi-file patches
 
@@ -310,6 +391,14 @@ Selectors contain exactly one OpenSSH public key, optionally with blank/comment 
 
 The 90-second agent budget covers socket connection, identities, unsigned probes, signing, and the server reply. Jump and target each receive their own budget. An explicit `--auth-timeout-ms` also sets an entire endpoint budget for legacy modes; without it, their existing 20-second per-request behavior remains. Authentication failure is terminal for an agent attempt, and at most one signature is requested per endpoint attempt. A later explicit tool call starts fresh; transient transport failures retain bounded reconnect retries.
 
+The CLI's startup snapshot can request agent signing before the first tool call.
+Its 3-second total bootstrap deadline takes precedence over endpoint budgets,
+including on jump/proxy routes. If hardware interaction cannot finish in time,
+startup continues with unknown metadata; a later tool call can authenticate with
+the normal endpoint budget. A successful startup connection is reused by tools
+without another signature. Library construction remains lazy unless the caller
+uses `with_startup_environment`.
+
 When either endpoint uses an agent, `auto` chooses `exec-raw` directly. File/directory uploads and downloads, foreground/background jobs, overwrite checks, and cancellation use the authenticated route. Explicit `sftp`, `scp`, and `rsync` requests fail before destination mutation.
 
 This provides authentication only. The local socket is never forwarded to the remote host. Connection reuse is SeSSHion's own persistent connection, independent of OpenSSH `ControlMaster`. Removing the token does not revoke an already authenticated session. Background-job durability remains as described below.
@@ -318,7 +407,7 @@ This provides authentication only. The local socket is never forwarded to the re
 
 Launch one stdio MCP process per local client from Herdr's environment, with `SSH_AUTH_SOCK` available to each child. Give Codex, oh-my-pi, Grok, and Amp distinct absolute spool directories and separate remote worktrees. Keep ephemeral socket paths out of shared configuration; pass the environment value at launch. These examples use `/Users/alice` as a placeholder for an absolute local home path.
 
-The following client examples are **protocol-compatible only**: their settings were checked against the linked client documentation, but interactive client sessions and physical hardware were not exercised. The actual SeSSHion stdio workflow is exercised by the four-process integration test. Authentication is lazy, so client per-tool deadlines must accommodate the endpoint budgets plus command work; a route with two agent endpoints can need more than 180 seconds. Client startup timeouts are unaffected.
+The following client examples are **protocol-compatible only**: their settings were checked against the linked client documentation, but interactive client sessions and physical hardware were not exercised. The actual SeSSHion stdio workflow is exercised by the four-process integration test. CLI startup includes the bounded 3-second environment probe described above. Client per-tool deadlines must still accommodate endpoint authentication budgets plus command work when startup did not establish a route; a route with two agent endpoints can need more than 180 seconds.
 
 **Codex** — `~/.codex/config.toml` ([configuration reference](https://developers.openai.com/codex/config-reference)):
 
@@ -419,6 +508,8 @@ Start potentially long commands or transfers with `background=true`. MCP does no
 ```json
 {"job_id": "abc123", "tail_lines": 50}
 ```
+
+Treat job IDs as opaque and use the originating MCP instance to query them. IDs distinguish concurrent local server processes even when jobs start in the same millisecond.
 
 For a scheduled one-shot observation, set a local wait in seconds:
 

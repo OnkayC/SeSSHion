@@ -239,6 +239,10 @@ mod tests {
         );
 
         let bytes = serde_json::to_vec(&tools).expect("serialize default tool surface");
+        println!(
+            "default tool surface: {} bytes (budget {WIRE_BUDGET_BYTES})",
+            bytes.len()
+        );
         assert!(
             bytes.len() <= WIRE_BUDGET_BYTES,
             "default tool surface is {} bytes; budget is {WIRE_BUDGET_BYTES}",
